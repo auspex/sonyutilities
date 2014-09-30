@@ -1,0 +1,16 @@
+<project default="build">
+	<target name="build">
+		<exec executable="calibre-debug">
+			<arg value="-s" />
+		</exec>
+		<exec executable="calibre-customize">
+			<arg value="-b" />
+			<arg value="${basedir}" />
+		</exec>
+		<exec executable="calibre-debug">
+			<arg value="-g" />
+			<env key="CALIBRE_DEVELOP_FROM"
+				path="${user.home}/calibre/calibre/src" />
+		</exec>
+	</target>
+</project>
