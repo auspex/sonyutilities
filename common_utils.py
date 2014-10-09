@@ -1,10 +1,11 @@
-#!/usr/bin/env python
-# vim:fileencoding=UTF-8:ts=4:sw=4:sta:et:sts=4:ai
+#!/usr/bin/python
+# -*- coding: UTF-8 -*-
 from __future__ import (unicode_literals, division, absolute_import,
                         print_function)
 
 __license__   = 'GPL v3'
-__copyright__ = '2012, Derek Broughton <auspex@pointerstop.ca>'
+__copyright__ = '2012, David Forrester <davidfor@internode.on.net>'\
+                '2014, Derek Broughton <auspex@pointerstop.ca>'
 __docformat__ = 'restructuredtext en'
 
 import os, time
@@ -26,6 +27,8 @@ from calibre.gui2.keyboard import ShortcutConfig
 from calibre.utils.config import config_dir
 from calibre.utils.date import now, format_date, UNDEFINED_DATE
 from calibre import prints
+import sys
+import sqlite3
 
 # Global definition of our plugin name. Used for common functions that require this.
 plugin_name = None
@@ -35,11 +38,25 @@ plugin_icon_resources = {}
 
 BASE_TIME = None
 def debug_print(*args):
-    global BASE_TIME
-    if BASE_TIME is None:
-        BASE_TIME = time.time()
+    """
+    Print all args, prefixed by a time stamp and the module/method from which it was called
+    
+    >>> from calibre_plugins.sonyutilities.common_utils import debug_print
+    >>> DEBUG=True
+    
+    Unfortunately, that doesn't seem to actually set DEBUG, and we get nothing...
+    >>> debug_print("test", "message")
+    
+    """
     if DEBUG:
-        prints('DEBUG: %6.1f'%(time.time()-BASE_TIME), *args)
+        code = sys._getframe(1).f_code
+        method_name = code.co_filename+'::'+code.co_name
+        del code
+    
+        global BASE_TIME
+        if BASE_TIME is None:
+            BASE_TIME = time.time()
+        prints('DEBUG: %6.1f'%(time.time()-BASE_TIME), method_name, '-', *args)
 
 
 
@@ -280,7 +297,7 @@ class RatingTableWidgetItem(QTableWidgetItem):
 class DateTableWidgetItem(QTableWidgetItem):
 
     def __init__(self, date_read, is_read_only=False, default_to_today=False, fmt=None):
-#        debug_print("DateTableWidgetItem:__init__ - date_read=", date_read)
+#        debug_print("date_read=", date_read)
         if date_read is None or date_read == UNDEFINED_DATE and default_to_today:
             date_read = now()
         if is_read_only:
@@ -544,3 +561,115 @@ class ProgressBar(QDialog):
     def set_value(self, value):
         self.progressBar.setValue(value)
         self.refresh()
+
+class Cursor():
+    """
+    Given a path to a SQLite database, return an object containing the path and 
+    an open cursor into the database
+    >>> import os
+    >>> from calibre_plugins.sonyutilities.common_utils import Cursor 
+    >>> path1 = os.tempnam() 
+    >>> x = Cursor(path1)
+    >>> print (x.path == path1)
+    True
+    >>> print (x.cursor)
+    <sqlite3.Cursor object at ...
+       
+    """
+    def __init__(self,path):
+        self.path  = path
+        connection = sqlite3.connect(path)
+        # return bytestrings if the content cannot be decoded as unicode
+        connection.text_factory = lambda x: unicode(x, "utf-8", "ignore")
+        connection.row_factory  = sqlite3.Row
+        self.cursor = connection.cursor()
+        del connection
+         
+class SonyDB(dict):
+    """
+    Given a dictionary of database paths indexed by database prefix,
+    open cursors for each, and return a dictionary of Cursor objects, indexed by prefix
+      
+    The structure is suitable for using within a "with closing(...) as ..." structure
+    and all cursors will be automatically closed when the end of the "with" block is reached.
+      
+    Create a SonyDB object (using empty databases), and check that it has correct structure
+    >>> from calibre_plugins.sonyutilities.common_utils import SonyDB
+    >>> path1 = os.tempnam()
+    >>> path2 = os.tempnam()
+    >>> testdict = {'a': path1, 'b' : path2}
+    >>> obj = SonyDB(testdict)
+    >>> print(obj['a'].path == path1)
+    True
+    >>> print(obj['b'].path == path2)
+    True
+    >>> print(obj['a'].cursor)
+    <sqlite3.Cursor object ...
+      
+    Try opening the SonyDB and executing queries:
+      
+    >>> from contextlib import closing
+    >>> with closing(SonyDB(testdict)) as db:
+    ...     for prefix in db:
+    ...         print(db[prefix].cursor.execute('PRAGMA integrity_check'))
+    <sqlite3.Cursor object...
+    <sqlite3.Cursor object...
+
+    Since the 'with' block is closed, the cursors will be too
+    >>> db['a'].cursor.execute('PRAGMA integrity_check')
+    Traceback (most recent call last):
+        ...
+    ProgrammingError: Cannot operate on a closed database.
+  
+    Finally write some garbage into one of the 'db' files and execute the queries:
+      
+    >>> with (open(path1,'w')) as stream:
+    ...     stream.write('test')
+    >>> with closing(SonyDB(testdict)) as db:
+    ...     for prefix in db:
+    ...         db[prefix].cursor.execute('PRAGMA integrity_check')
+    Traceback (most recent call last):
+        ...
+    DatabaseError: file is encrypted or is not a database
+          
+    """
+
+    def __init__(self, db):
+        cursors = {}
+        for key in db:
+            cursors[key]= Cursor(db[key]) 
+        super(SonyDB, self).__init__(cursors)
+       
+            
+    def close(self):
+        for key in self.keys():
+            self[key].cursor.connection.commit()
+            self[key].cursor.connection.close()
+
+
+def convert_sony_date(sony_date):
+    """
+    Convert an input sony date to a python Datetime
+
+    Sony's dates are unix timestamps multiplied by 1000 
+    - somebody must have felt it was necessary to save those few characters per date
+
+    Create a timestamp for "2000-11-30"
+    >>> from calibre_plugins.sonyutilities.common_utils import convert_sony_date
+    >>> import time
+    >>> from datetime import datetime
+    >>> tm = time.mktime(time.strptime("2000-11-30 UTC", "%Y-%m-%d %Z"))
+    >>> print(tm)
+    975556800.0
+    >>> print(convert_sony_date(int(tm*1000)))
+    2000-11-30 00:00:00+00:00
+
+    """
+    from calibre.utils.date import utc_tz
+    from datetime import datetime
+    if sony_date:
+        converted_date = datetime.fromtimestamp(sony_date/1000).replace(tzinfo=utc_tz)
+    else:
+        converted_date = None
+    return converted_date
+            

@@ -8,10 +8,15 @@ __copyright__ = '2011, Grant Drake <grant.drake@gmail.com>'
 __docformat__ = 'restructuredtext en'
 
 import re
+import os
+
 from calibre.utils.date import format_date
 from calibre.ebooks.metadata import fmt_sidx
 from calibre.ebooks.metadata.book.base import Metadata
 from calibre_plugins.sonyutilities.common_utils import debug_print
+from calibre.ebooks.oeb.iterator.book import EbookIterator as _iterator
+from calibre.ebooks.oeb.parse_utils import parse_html, xpath
+from lxml import etree
 
 def get_indent_for_index(series_index):
     if not series_index:
@@ -185,3 +190,160 @@ class SeriesBook(object):
                     return '%06.2f%s'% (series_number, series)
         return ''
 
+class EbookIterator(_iterator):
+    def __init__(self, pathtoebook, log=None):
+        """
+        The superclass is not a true "iterator". This makes it a little closer
+        by combining the __init__() and __enter__() methods
+        
+        """
+        super(EbookIterator, self).__init__(pathtoebook, log=log)
+        self.__enter__(only_input_plugin=True, read_anchor_map=False)
+
+    def __iter__(self):
+        """ make it a proper iterable, by exposing the spine as the iterator 
+        """ 
+        return iter(self.spine)
+    
+            
+    def convert_from_sony_bookmark(self, bookmark, title=''):
+        """
+        Convert Sony bookmarks to Calibre format
+        
+        A sony bookmark looks like:
+        >>> sony_bookmark = "titlepage.xhtml#point(/1/4/2/2:0)"
+        
+        Create a dummy book class that doesn't actually have to open a file 
+        >>> from calibre_plugins.sonyutilities.iterator import EbookIterator
+        >>> class Tempdir():
+        ...     tdir='/tmp'
+        >>> class DummyBook(EbookIterator):
+        ...     def __init__(self):
+        ...         self.spine = ['/tmp/dummy1.xhtml', '/tmp/titlepage.xhtml', '/tmp/dummy1.xhtml',]
+        ...         self._tdir = Tempdir()
+        >>> book = DummyBook()
+        >>> print(book.convert_from_sony_bookmark(sony_bookmark,'my bookmark'))
+        {'spine': 1, 'type': 'cfi', 'pos': u'/2/4/2/2:0', 'title': 'my bookmark'}
+        
+        """
+        filename,pos = bookmark.split('#point')
+        pos          = pos.strip(u'(\x00)').split('/')
+        # Adobe Digital Editions doesn't count the tags correctly
+        if pos[1] == '1':
+            pos[1] = '2'
+        pos = '/'.join(pos)
+        prefix       = self._tdir.tdir
+        path         = os.path.join(prefix,filename)
+        spine_num    = self.spine.index(path)
+        
+        bm = dict(title=title, type='cfi', spine=spine_num, pos=pos)
+        return bm
+    
+    def convert_to_sony_bookmark(self, bm):
+        """
+        Convert Calibre bookmarks to Sony format
+        
+        A sony bookmark looks like:
+        >>> sony_bookmark = "titlepage.xhtml#point(/1/4/2/2:0)"
+        
+        The (internal) Calibre bookmark is a dictionary:
+        >>> calibre_bm = {'spine': 1, 'type': 'cfi', 'pos': u'/2/4/2/2:0', 'title': 'my bookmark'}
+        
+        >>> print(book.convert_to_sony_bookmark(calibre_bm))
+        titlepage.xhtml#point(/1/4/2/2:0)
+        
+        """
+        prefix      = self._tdir.tdir+'/'
+        filename    = self.spine[bm['spine']].rpartition(prefix)[2]
+        pos         = bm['pos'].split('/')
+        
+        # ADE doesn't count the <HEAD> tag
+        if pos[1] == '2':
+            pos[1]  = '1'
+                
+        bookmark = "%s#point(%s)" % (filename, '/'.join(pos))
+        return bookmark
+
+
+    def calculate_percent_read(self,bookmark):
+        """
+        Open a book and figure out how far into it we are from the bookmark
+        
+        Sony store a current page number, and total number of pages, for books downloaded 
+        from their store (now Kobo), but doesn't store it for sideloaded books.
+        
+        >>> 
+        """
+        CFI = re.compile(r'([\[\]:@~])')
+        node_len  = lambda x: len(x) if x is not None else 0
+
+        def walk_tree(parent, pos):
+            # find the tag number we're looking for
+            tag_parts = CFI.split(pos.pop(0))
+            tag_id = ''
+            offset = 0
+    
+            if len(tag_parts) > 1:
+                if tag_parts[1] == '[':
+                    tag_id = tag_parts[2]
+                elif tag_parts[1] == ':':
+                    try:
+                        offset = int(tag_parts[2])
+                    except Exception, e:
+                        debug_print(e)
+                    
+            tag_num = int(tag_parts[0])
+    
+            if tag_num > 1:
+                left_char_cnt  = node_len(parent.text)
+            else:
+                left_char_cnt  = 0
+            right_char_cnt     = node_len(parent.tail)
+            
+            if tag_id:
+                tag_node   = parent.find(".//*[id='%s']" % tag_id)
+                if tag_node:
+                    tag_num= parent.index(tag_node)
+                
+            # if it's an odd numbered node, it's text
+            text_node = (tag_num % 2 == 1)
+            # actual tags are even indexes (odd numbers indicate the text between tags)
+            # so pos: 2->0, 4->1, 6->2, etc
+            idx       = (tag_num-1)//2
+            # find all the text to the left of our pointer
+            left_char_cnt += sum([len(etree.tostring(node,method="text"))+node_len(node.tail)
+                                  for node in parent[:idx]])
+            # now, if it's a text node, we counted too far
+            # subtract the tail of the last node, and add any offset
+            if text_node:
+                left_char_cnt += offset - node_len(node.tail)
+            # if it's a tag node, drill down, if there's anything left to drill 
+            elif pos:
+                l,r  = walk_tree(parent[idx], pos)
+                left_char_cnt += l
+                right_char_cnt+= r
+            else:
+                left_char_cnt += offset
+                right_char_cnt+= len(etree.tostring(parent[idx],method="text"))+node_len(parent[idx].tail)-offset
+            # and find the characters to the right of our pointer
+            right_char_cnt += sum([len(etree.tostring(node,method="text"))+node_len(node.tail)
+                                  for node in parent[idx+1:]])
+                
+            return left_char_cnt, right_char_cnt
+            
+        
+        bookmark     = unicode(bookmark)
+        bm           = self.convert_from_sony_bookmark(bookmark, title=u'calibre_current_page_bookmark')
+        spine_num    = bm['spine']
+        total_pages  = sum(self.pages)
+        pages_before = sum(self.pages[:spine_num])
+        
+        raw          = open(self.spine[spine_num]).read()
+        html         = parse_html(raw, self.log)
+        # we'll start from the <body> element, which is /2/4 in the EPUB CFI format
+        pos          = bm['pos'].split('/')[3:]
+        body         = xpath(html, '//h:body')[0]
+        left,right   = walk_tree(body, pos)
+        pages_before+= self.pages[spine_num] * left / (left+right)
+        
+        return 100.0 * pages_before / total_pages

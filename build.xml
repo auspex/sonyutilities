@@ -13,4 +13,9 @@
 				path="${user.home}/calibre/calibre/src" />
 		</exec>
 	</target>
+	
+	<target name="test">
+	    <exec executable="testall.py">
+	    </exec>
+	</target>
 </project>

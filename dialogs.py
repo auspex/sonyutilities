@@ -1,17 +1,16 @@
-#!/usr/bin/env python
-# vim:fileencoding=UTF-8:ts=4:sw=4:sta:et:sts=4:ai
+#!/usr/bin/python
+# -*- coding: UTF-8 -*-
 from __future__ import (unicode_literals, division, absolute_import,
                         print_function)
-#from constants import debug
-#from common_utils import debug_print
 
 __license__   = 'GPL v3'
-__copyright__ = '2014, Derek Broughton <auspex@pointerstop.ca>'
+__copyright__ = '2012, David Forrester <davidfor@internode.on.net>'
 __docformat__ = 'restructuredtext en'
 
 import re
 import ConfigParser
 from datetime import datetime
+from contextlib import closing
 
 from calibre_plugins.sonyutilities.common_utils import debug_print
 try:
@@ -30,7 +29,6 @@ except ImportError as e:
 
 from calibre.ebooks.metadata import authors_to_string
 from calibre.gui2 import gprefs, warning_dialog, error_dialog, question_dialog, open_url, choose_dir
-# from calibre.gui2.convert.metadata import create_opf_file, create_cover_file
 
 from functools import partial
 from urllib import quote_plus
@@ -39,8 +37,6 @@ from calibre.gui2.complete2 import EditWithComplete
 from calibre.utils.config import tweaks
 from calibre.utils.date import qt_to_dt, utc_tz
 from calibre.utils.icu import sort_key
-
-# from calibre.customize.zipplugin import load_translations
 
 try:
     from calibre.gui2 import QVariant
@@ -61,11 +57,10 @@ else:
 
 from calibre_plugins.sonyutilities.common_utils import (SizePersistedDialog, ReadOnlyTableWidgetItem, ImageTitleLayout,
                      DateDelegate, DateTableWidgetItem, RatingTableWidgetItem, CheckableTableWidgetItem,
-                     get_icon, )
+                     get_icon, SonyDB, convert_sony_date)
 #                     debug_print, get_icon, get_library_uuid)
 from calibre_plugins.sonyutilities.book import SeriesBook
 import calibre_plugins.sonyutilities.config as cfg
-#from calibre_plugins.sonyutilities.action import (convert_sony_date)
 
 # Checked with FW2.5.2
 LINE_SPACINGS =     [1.3, 1.35, 1.4, 1.6, 1.775, 1.9, 2, 2.2, 3 ]
@@ -129,7 +124,7 @@ except NameError:
     pass # load_translations() added in calibre 1.9
 
 def get_plugin_pref(store_name, option):
-    return cfg.plugin_prefs.get(cfg.option, cfg.METADATA_OPTIONS_DEFAULTS[cfg.KEY_SET_TITLE]) 
+    return cfg.plugin_prefs.get(option, cfg.METADATA_OPTIONS_DEFAULTS[cfg.KEY_SET_TITLE]) 
 
 class AuthorTableWidgetItem(ReadOnlyTableWidgetItem):
     def __init__(self, text, sort_key):
@@ -145,7 +140,7 @@ class QueueProgressDialog(QProgressDialog):
 
     def __init__(self, gui, books, tdir, options, queue, db, plugin_action=None):
         QProgressDialog.__init__(self, '', '', 0, len(books), gui)
-        debug_print("QueueProgressDialog::__init__")
+        debug_print("")
         self.setMinimumWidth(500)
         self.books, self.tdir, self.options, self.queue, self.db = \
             books, tdir, options, queue, db
@@ -154,44 +149,13 @@ class QueueProgressDialog(QProgressDialog):
         self.i, self.books_to_scan = 0, []
 
         self.options['count_selected_books'] = len(self.books) if self.books else 0
-        self.setWindowTitle(_("Queueing books for storing reading position"))
+        self.setWindowTitle(_("Queuing books for storing reading position"))
         QTimer.singleShot(0, self.do_books)
         self.exec_()
 
-    def do_book(self):
-        debug_print("QueueProgressDialog::do_book")
-        book = self.books[self.i]
-        self.i += 1
-        
-        library_db     = self.db #self.gui.current_db
-        library_config = cfg.get_library_config(library_db)
-        sony_bookmark_column    = library_config.get(cfg.KEY_CURRENT_LOCATION_CUSTOM_COLUMN, cfg.DEFAULT_LIBRARY_VALUES[cfg.KEY_CURRENT_LOCATION_CUSTOM_COLUMN])
-        sony_percentRead_column = library_config.get(cfg.KEY_PERCENT_READ_CUSTOM_COLUMN, cfg.DEFAULT_LIBRARY_VALUES[cfg.KEY_PERCENT_READ_CUSTOM_COLUMN])
-        last_read_column        = library_config.get(cfg.KEY_LAST_READ_CUSTOM_COLUMN, cfg.DEFAULT_LIBRARY_VALUES[cfg.KEY_LAST_READ_CUSTOM_COLUMN])
-
-
-        for book in self.books:
-            title               = book.title
-            authors             = authors_to_string(book.authors)
-            contentIDs          = book.contentIDs
-            current_chapterid   = None
-            current_percentRead = None
-            current_rating      = None
-            current_last_read   = None
-            if sony_bookmark_column:
-                current_chapterid = book.get_user_metadata(sony_bookmark_column, True)['#value#']
-            if sony_percentRead_column:
-                current_percentRead = book.get_user_metadata(sony_percentRead_column, True)['#value#']
-            if last_read_column:
-                current_last_read = book.get_user_metadata(last_read_column, True)['#value#']
-
-            if len(contentIDs) > 0:
-                self.books_to_scan.append((book.calibre_id, contentIDs, title, authors, current_chapterid, current_percentRead, current_rating, current_last_read))
-
-        return self.do_queue()
 
     def do_books(self):
-        debug_print("QueueProgressDialog::do_books - Start")
+        debug_print("Start")
 #        book = self.books[self.i]
         
         library_db              = self.db
@@ -200,7 +164,7 @@ class QueueProgressDialog(QProgressDialog):
         sony_percentRead_column = library_config.get(cfg.KEY_PERCENT_READ_CUSTOM_COLUMN, cfg.DEFAULT_LIBRARY_VALUES[cfg.KEY_PERCENT_READ_CUSTOM_COLUMN])
         last_read_column        = library_config.get(cfg.KEY_LAST_READ_CUSTOM_COLUMN, cfg.DEFAULT_LIBRARY_VALUES[cfg.KEY_LAST_READ_CUSTOM_COLUMN])
 
-        debug_print("QueueProgressDialog::do_books - sony_percentRead_column=", sony_percentRead_column)
+        debug_print("sony_percentRead_column=", sony_percentRead_column)
         self.setLabelText(_('Preparing the list of books ...'))
         self.setValue(1)
         search_condition = ''
@@ -208,74 +172,43 @@ class QueueProgressDialog(QProgressDialog):
             search_condition = 'and ({0}:false or {0}:<100)'.format(sony_percentRead_column)
         if self.options['allOnDevice']:
             search_condition = 'ondevice:True {0}'.format(search_condition)
-            debug_print("QueueProgressDialog::do_books - search_condition=", search_condition)
+            debug_print("search_condition=", search_condition)
             onDeviceIds = set(library_db.search_getting_ids(search_condition, None, sort_results=False, use_virtual_library=False))
         else:
             onDeviceIds = self.plugin_action._get_selected_ids()
 
         self.books = self.plugin_action._convert_calibre_ids_to_books(library_db, onDeviceIds)
         self.setRange(0, len(self.books))
-        for book in self.books:
-            self.i += 1
-            device_book_paths = self.plugin_action.get_device_paths_from_id(book.calibre_id)
-#            debug_print("QueueProgressDialog::do_all_books -- device_book_paths:", device_book_paths)
-#            book.paths = device_book_paths
-            book.contentIDs = [self.plugin_action.contentid_from_path(path) for path in device_book_paths]
-            if len(book.contentIDs):
-                self.setLabelText(_('Queuing ') + book.title)
-                data = dict(
-                    id          = book.calibre_id,
-                    title       = book.title,
-                    authors     = authors_to_string(book.authors),
-                    contentIds  = book.contentIDs,
-                    paths       = device_book_paths,
-                    bookmark    = book.get_user_metadata(sony_bookmark_column, True)['#value#'] if sony_bookmark_column else None,
-                    percentRead = book.get_user_metadata(sony_percentRead_column, True)['#value#'] if sony_percentRead_column else None,
-                    last_read   = book.get_user_metadata(last_read_column, True)['#value#'] if last_read_column else None
-                )
-                self.books_to_scan.append(data)
-            self.setValue(self.i)
+        import pydevd;pydevd.settrace()
+        with closing(SonyDB(self.plugin_action.device_database_path)) as db:
+            for book in self.books:
+                self.i += 1
+                device_book_paths = self.plugin_action.get_device_paths_from_id(book.calibre_id)
+    #            debug_print("device_book_paths:", device_book_paths)
+    #            book.paths = device_book_paths
+                book.contentIDs = [self.plugin_action.get_contentID_from_path(path, db.cursors) 
+                                   for path in device_book_paths]
+                if len(book.contentIDs):
+                    self.setLabelText(_('Queuing ') + book.title)
+                    data = dict(
+                        id          = book.calibre_id,
+                        title       = book.title,
+                        authors     = authors_to_string(book.authors),
+                        contentIds  = book.contentIDs,
+                        paths       = device_book_paths,
+                        bookmark    = book.get_user_metadata(sony_bookmark_column, True)['#value#'] if sony_bookmark_column else None,
+                        percentRead = book.get_user_metadata(sony_percentRead_column, True)['#value#'] if sony_percentRead_column else None,
+                        last_read   = book.get_user_metadata(last_read_column, True)['#value#'] if last_read_column else None
+                    )
+                    self.books_to_scan.append(data)
+                self.setValue(self.i)
 
-        debug_print("QueueProgressDialog::do_books - Finish")
+        debug_print("Finish")
         return self.do_queue()
-
-#    def do_book(self):
-#        debug_print("QueueProgressDialog::do_book")
-#        book = self.books[self.i]
-#        self.i += 1
-#
-#        title   = book.title
-#        authors = authors_to_string(book.authors)
-#        contentIDs = book.contentIDs
-#
-#        if len(contentIDs) > 0:
-#            self.books_to_scan.append((book.calibre_id, contentIDs, title, authors))
-#
-#        self.setValue(self.i)
-#        if self.i >= len(self.books):
-#            return self.do_queue()
-#        else:
-#            QTimer.singleShot(0, self.do_book)
-
-#    def do_book(self):
-#        debug_print("QueueProgressDialog::do_book")
-#        book_id = self.books[self.i]
-#        self.i += 1
-#
-#        title  = self.db.title(book_id, index_is_id=True)
-#        authors = authors_to_string(self._authors_to_list(self.db, book_id))
-#
-#        self.books_to_scan.append((book_id, title, authors))
-#
-#        self.setValue(self.i)
-#        if self.i >= len(self.book_ids):
-#            return self.do_queue()
-#        else:
-#            QTimer.singleShot(0, self.do_book)
 
 
     def do_queue(self):
-        debug_print("QueueProgressDialog::do_queue")
+        debug_print("")
         if self.gui is None:
             # There is a nasty QT bug with the timers/logic above which can
             # result in the do_queue method being called twice
@@ -299,7 +232,7 @@ class ReaderOptionsDialog(SizePersistedDialog):
         self.plugin_action = plugin_action
         self.help_anchor   = "SetReaderFonts"
 
-        debug_print("ReaderOptionsDialog:__init__ - self.plugin_action.device_fwversion=", self.plugin_action.device_fwversion())
+        debug_print("self.plugin_action.device_fwversion=", self.plugin_action.device_fwversion())
         self.line_spacings = LINE_SPACINGS
         if self.plugin_action.device_fwversion() >= (3, 2, 0):
             self.line_spacings = LINE_SPACINGS_320
@@ -313,7 +246,7 @@ class ReaderOptionsDialog(SizePersistedDialog):
         # Set some default values from last time dialog was used.
         self.prefs = cfg.plugin_prefs[cfg.READING_OPTIONS_STORE_NAME]
         self.change_settings(self.prefs)
-        debug_print("ReaderOptionsDialog:__init__ - ", self.prefs)
+        debug_print("", self.prefs)
         if self.prefs.get(cfg.KEY_READING_LOCK_MARGINS, False):
             self.lock_margins_checkbox.click()
         if self.prefs.get(cfg.KEY_UPDATE_CONFIG_FILE, False):
@@ -418,10 +351,10 @@ class ReaderOptionsDialog(SizePersistedDialog):
         self.prefs[cfg.KEY_READING_FONT_SIZE]   = int(unicode(self.font_size_spin.value()))
         if self.custom_line_spacing_is_checked():
             self.prefs[cfg.KEY_READING_LINE_HEIGHT] = float(unicode(self.custom_line_spacing_edit.text()))
-            debug_print("ReaderOptionsDialog:ok_clicked - custom -self.prefs[cfg.KEY_READING_LINE_HEIGHT]=", self.prefs[cfg.KEY_READING_LINE_HEIGHT])
+            debug_print("custom -self.prefs[cfg.KEY_READING_LINE_HEIGHT]=", self.prefs[cfg.KEY_READING_LINE_HEIGHT])
         else:
             self.prefs[cfg.KEY_READING_LINE_HEIGHT] = self.line_spacings[int(unicode(self.line_spacing_spin.value()))]
-            debug_print("ReaderOptionsDialog:ok_clicked - spin - self.prefs[cfg.KEY_READING_LINE_HEIGHT]=", self.prefs[cfg.KEY_READING_LINE_HEIGHT])
+            debug_print("spin - self.prefs[cfg.KEY_READING_LINE_HEIGHT]=", self.prefs[cfg.KEY_READING_LINE_HEIGHT])
         self.prefs[cfg.KEY_READING_LEFT_MARGIN]  = int(unicode(self.left_margins_spin.value()))
         self.prefs[cfg.KEY_READING_RIGHT_MARGIN] = int(unicode(self.right_margins_spin.value()))
         self.prefs[cfg.KEY_READING_LOCK_MARGINS] = self.lock_margins_checkbox_is_checked()
@@ -458,7 +391,7 @@ class ReaderOptionsDialog(SizePersistedDialog):
         sonyConfig = ConfigParser.SafeConfigParser(allow_no_value=True)
         device = self.parent().device_manager.connected_device
         device_path = self.parent().device_manager.connected_device._main_prefix
-        debug_print("get_device_settings - device_path=", device_path)
+        debug_print("device_path=", device_path)
         sonyConfig.read(device.normalize_path(device_path + '.sony/Sony/Sony eReader.conf'))
         
         device_settings = {}
@@ -485,7 +418,7 @@ class ReaderOptionsDialog(SizePersistedDialog):
 
     def change_settings(self, reader_settings):
         font_face = reader_settings.get(cfg.KEY_READING_FONT_FAMILY, cfg.READING_OPTIONS_DEFAULTS[cfg.KEY_READING_FONT_FAMILY])
-        debug_print("ReaderOptionsDialog:change_settings - font_face=", font_face)
+        debug_print("font_face=", font_face)
         self.font_choice.select_text(font_face)
         
         justification = reader_settings.get(cfg.KEY_READING_ALIGNMENT, cfg.READING_OPTIONS_DEFAULTS[cfg.KEY_READING_ALIGNMENT])
@@ -495,14 +428,14 @@ class ReaderOptionsDialog(SizePersistedDialog):
         self.font_size_spin.setProperty('value', font_size)
         
         line_spacing = reader_settings.get(cfg.KEY_READING_LINE_HEIGHT, cfg.READING_OPTIONS_DEFAULTS[cfg.KEY_READING_LINE_HEIGHT])
-        debug_print("ReaderOptionsDialog:change_settings - line_spacing='%s'" % line_spacing)
+        debug_print("line_spacing='%s'" % line_spacing)
         if line_spacing in self.line_spacings:
             line_spacing_index = self.line_spacings.index(line_spacing)
-            debug_print("ReaderOptionsDialog:change_settings - line_spacing_index=", line_spacing_index)
+            debug_print("line_spacing_index=", line_spacing_index)
             self.custom_line_spacing_checkbox.setCheckState(Qt.Checked)
         else:
             self.custom_line_spacing_checkbox.setCheckState(Qt.Unchecked)
-            debug_print("ReaderOptionsDialog:change_settings - line_spacing_index not found")
+            debug_print("line_spacing_index not found")
             line_spacing_index = 0
         self.custom_line_spacing_checkbox.click()
         self.custom_line_spacing_edit.setText(unicode(line_spacing))
@@ -669,7 +602,7 @@ class UpdateMetadataOptionsDialog(SizePersistedDialog):
 
         # Only if the user has checked at least one option will we continue
         for key in self.new_prefs:
-            debug_print("UpdateMetadataOptionsDialog:ok_clicked - key='%s' self.new_prefs[key]=%s" % (key, self.new_prefs[key]))
+            debug_print("key='%s' self.new_prefs[key]=%s" % (key, self.new_prefs[key]))
             if self.new_prefs[key] and not key == cfg.KEY_READING_STATUS:
                 self.accept()
                 return
@@ -1716,7 +1649,7 @@ class ManageSeriesDeviceDialog(SizePersistedDialog):
         super(ManageSeriesDeviceDialog, self).reject()
 
     def series_column_changed(self):
-        debug_print("series_column_changed - start")
+        debug_print("start")
         series_column = self.series_column_combo.selected_value()
         SeriesBook.series_column = series_column
         # Choose a series name and series index from the first book in the list
@@ -1725,7 +1658,7 @@ class ManageSeriesDeviceDialog(SizePersistedDialog):
         if len(self.books) > 0:
             first_book = self.books[0]
             initial_series_name = first_book.series_name()
-            debug_print("series_column_changed - initial_series_name", initial_series_name)
+            debug_print("initial_series_name", initial_series_name)
             if initial_series_name:
                 debug_print("series_column_changed first_book.series_index()=", first_book.series_index())
                 initial_series_index = int(first_book.series_index())
@@ -2188,10 +2121,10 @@ class ShowReadingPositionChangesDialog(SizePersistedDialog):
         for i in range(len(self.reading_locations)):
             self.reading_locations_table.selectRow(i)
             enabled = bool(self.reading_locations_table.item(i, 0).checkState())
-            debug_print("ShowReadingPositionChangesDialog:_ok_clicked - row=%d, enabled=%s", i, enabled)
+            debug_print("row=%d, enabled=%s", i, enabled)
             if not enabled:
                 book_id = convert_qvariant(self.reading_locations_table.item(i, 7).data(Qt.DisplayRole))
-                debug_print("ShowReadingPositionChangesDialog:_ok_clicked - row=%d, book_id=%s", i, book_id)
+                debug_print("row=%d, book_id=%s", i, book_id)
                 del self.reading_locations[book_id]
         self.accept()
         return
@@ -2228,10 +2161,10 @@ class ShowReadingPositionChangesTableWidget(QTableWidget):
         self.verticalHeader().setDefaultSectionSize(24)
         self.horizontalHeader().setStretchLastSection(True)
 
-        debug_print("ShowReadingPositionChangesDialog:populate_table - reading_positions=", reading_positions)
+        debug_print("reading_positions=", reading_positions)
         row = 0
         for book_id, reading_position in reading_positions.iteritems():
-#            debug_print("ShowReadingPositionChangesDialog:populate_table - reading_position=", reading_position)
+#            debug_print("reading_position=", reading_position)
             self.populate_table_row(row, book_id, reading_position)
             row += 1
 
@@ -2257,13 +2190,13 @@ class ShowReadingPositionChangesTableWidget(QTableWidget):
             self.setColumnWidth(col, minimum)
 
     def populate_table_row(self, row, book_id, reading_position):
-#        debug_print("ShowReadingPositionChangesTableWidget:populate_table_row - shelf:", row, shelf[0], shelf[1], shelf[2], shelf[3])
+#        debug_print("shelf:", row, shelf[0], shelf[1], shelf[2], shelf[3])
         self.blockSignals(True)
 
         book = self.db.get_metadata(book_id, index_is_id=True, get_cover=False)
-#        debug_print("ShowReadingPositionChangesTableWidget:populate_table_row - book_id:", book_id)
-#        debug_print("ShowReadingPositionChangesTableWidget:populate_table_row - book:", book)
-#        debug_print("ShowReadingPositionChangesTableWidget:populate_table_row - reading_position:", reading_position)
+#        debug_print("book_id:", book_id)
+#        debug_print("book:", book)
+#        debug_print("reading_position:", reading_position)
 
         self.setItem(row, 0, CheckableTableWidgetItem(True))
 
@@ -2279,7 +2212,7 @@ class ShowReadingPositionChangesTableWidget(QTableWidget):
         current_percent.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.setItem(row, 3, current_percent)
         
-#        debug_print("ShowReadingPositionChangesTableWidget:populate_table_row - reading_position[4]:", reading_position[4])
+#        debug_print("reading_position[4]:", reading_position[4])
         new_percentRead = 0 
         if reading_position[2] == 1:
             new_percentRead = reading_position[3]
@@ -2294,7 +2227,7 @@ class ShowReadingPositionChangesTableWidget(QTableWidget):
             self.setItem(row, 5, DateTableWidgetItem(current_last_read,
                                                      is_read_only=True,
                                                      default_to_today=False))
-        self.setItem(row, 6, DateTableWidgetItem(self.parent().plugin_action.convert_sony_date(reading_position[5]), 
+        self.setItem(row, 6, DateTableWidgetItem(convert_sony_date(reading_position[5]), 
                                                  is_read_only=True,
                                                  default_to_today=False))
         book_idColumn = RatingTableWidgetItem(book_id)
@@ -2378,7 +2311,7 @@ class FixDuplicateShelvesDialog(SizePersistedDialog):
                     or self.purge_checkbox.checkState() == Qt.Checked
         # Only if the user has checked at least one option will we continue
         if have_options:
-            debug_print("FixDuplicateShelvesDialog:_ok_clicked - - options=%s" % self.options)
+            debug_print("- options=%s" % self.options)
             self.accept()
             return
         return error_dialog(self, 'No options selected',
@@ -2430,7 +2363,7 @@ class DuplicateShelvesInDeviceDatabaseTableWidget(QTableWidget):
             self.setColumnWidth(col, minimum)
 
     def populate_table_row(self, row, shelf):
-#        debug_print("DuplicateShelvesInDeviceDatabaseTableWidget:populate_table_row - shelf:", row, shelf[0], shelf[1], shelf[2], shelf[3])
+#        debug_print("shelf:", row, shelf[0], shelf[1], shelf[2], shelf[3])
         self.blockSignals(True)
         shelf_name = shelf[0] if shelf[0] else _("(Unnamed shelf)")
         titleColumn = QTableWidgetItem(shelf_name)
@@ -2655,7 +2588,7 @@ class OrderSeriesShelvesTableWidget(QTableWidget):
             self.setColumnWidth(col, minimum)
 
     def populate_table_row(self, row, shelf):
-#        debug_print("OrderSeriesShelvesTableWidget:populate_table_row - shelf:", row, shelf)
+#        debug_print("shelf:", row, shelf)
         self.blockSignals(True)
         nameColumn = QTableWidgetItem(shelf['name'])
         nameColumn.setFlags(Qt.ItemIsSelectable|Qt.ItemIsEnabled)
@@ -2668,7 +2601,7 @@ class OrderSeriesShelvesTableWidget(QTableWidget):
         self.blockSignals(False)
 
     def get_shelves(self):
-#        debug_print("OrderSeriesShelvesTableWidget:get_shelves - self.shelves:", self.shelves)
+#        debug_print("self.shelves:", self.shelves)
         shelves = []
         for row in range(self.rowCount()):
             rnum = convert_qvariant(self.item(row, 0).data(Qt.UserRole))

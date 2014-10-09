@@ -1,11 +1,15 @@
-#!/usr/bin/env python
-# vim:fileencoding=UTF-8:ts=4:sw=4:sta:et:sts=4:ai
+#!/usr/bin/python
+# -*- coding: UTF-8 -*-
 from __future__ import (division, absolute_import, print_function)
 
 __license__   = 'GPL v3'
 __copyright__ = '2014, Derek Broughton <auspex@pointerstop.ca>'
 __docformat__ = 'restructuredtext en'
 
+try:
+    import init_calibre
+except ImportError:
+    pass
 import ConfigParser
 import os, threading, time, shutil
 from datetime import datetime, timedelta
@@ -43,9 +47,11 @@ from calibre_plugins.sonyutilities.dialogs import (
                     FixDuplicateShelvesDialog, OrderSeriesShelvesDialog, ShowReadingPositionChangesDialog
                     )
 from calibre_plugins.sonyutilities.common_utils import (set_plugin_icon_resources, get_icon, ProgressBar,
-                                         create_menu_action_unique,  debug_print)
+                                                        SonyDB, convert_sony_date,
+                                                        create_menu_action_unique,  debug_print)
 from calibre_plugins.sonyutilities.book import SeriesBook
 import calibre_plugins.sonyutilities.config as cfg
+import sqlite3 
 
 PLUGIN_ICONS = ['images/icon.png', 'images/logo_sony.png', 'images/manage_series.png', 'images/lock.png', 'images/lock32.png',
                 'images/lock_delete.png', 'images/lock_open.png', 'images/sort.png',
@@ -68,36 +74,13 @@ EPUB_FETCH_QUERY = """
 SET_FRONT_PAGE_QUERY = """
 select min(reading_time) from (select _id, reading_time from books order by 2 desc limit 4);
 """
-# TODO: remove this when done
-KOBO_QUERY = 'SELECT c1.bookmark, ' \
-                        'c2.adobe_location, '      \
-                        'c1.ReadStatus, '          \
-                        'c1.___PercentRead, '      \
-                        'c1.Attribution, '         \
-                        'c1.DateLastRead, '        \
-                        'c1.Title, '               \
-                        'c1.MimeType, '            \
-                        'NULL as rating, '         \
-                        'c1.contentId '            \
-                    'FROM content c1 LEFT OUTER JOIN content c2 ON c1.bookmark = c2.ContentID ' \
-                    'WHERE c1.ContentID = ?'
-
-#TODO: convert Sony bookmark to Calibre bookmark
-# SONY format:     PATH#point(/1/4/227/1:0)
-# calibre format:  calibre_current_page_bookmark*|!|?|*IDX*|!|?|*/2/4/227/1:0
-# apparently: find the opf file in the epub,
-#             enumerate the <item> tags and find the index of the one with the 
-#             href equal to the PATH component of the Sony bookmark
-#             extract the arg from point() and add 1 to first value 
-#             - something makes me think this might actually be N*2, not N+1
 
 try:
-    debug_print("SonyUtilites::action.py - loading translations")
+    debug_print("loading translations")
     load_translations()
 except NameError:
-    debug_print("SonyUtilites::action.py - exception when loading translations")
+    debug_print("exception when loading translations")
     pass # load_translations() added in calibre 1.9
-
 
 # Implementation of QtQHash for strings. This doesn't seem to be in the Python implemention. 
 def qhash (inputstr):
@@ -161,6 +144,24 @@ class sonyutilitiesAction(InterfaceAction):
 
 
     def haveSony(self):
+        """
+        If there is currently a Sony PRST1 device attached, return True
+        
+        Create a dummy PRST1 device 
+        >>> class PRST1():
+        ...    pass
+        >>> action = sonyutilitiesAction()
+        
+        When the device 
+        >>> action.device = None
+        >>> print(action.haveSony)
+        False
+
+        >>> action.device = PRST1
+        >>> print(action.haveSony)
+        True
+        
+        """
         return self.device is not None and isinstance(self.device, PRST1)
 
 
@@ -169,39 +170,45 @@ class sonyutilitiesAction(InterfaceAction):
         self.device   = self.get_device()
 
         if self.haveSony() and cfg.get_plugin_pref(cfg.COMMON_OPTIONS_STORE_NAME, cfg.KEY_STORE_ON_CONNECT):
-            debug_print('SonyUtilites:library_changed - About to do auto store')
+            debug_print('About to do auto store')
             self.rebuild_menus()
             QTimer.singleShot(1000, self.auto_store_current_bookmark)
 
 
-    def do_work(self):
-        self.auto_store_current_bookmark()
-
-
     def _on_device_connection_changed(self, is_connected):
-        debug_print("sonyutilities:_on_device_connection_changed - self.plugin_device_connection_changed.__class__: ", self.plugin_device_connection_changed.__class__)
+        debug_print("self.plugin_device_connection_changed.__class__: ", self.plugin_device_connection_changed.__class__)
         debug_print("Methods for self.plugin_device_connection_changed: ", dir(self.plugin_device_connection_changed))
         self.plugin_device_connection_changed.emit(is_connected)
         if not is_connected:
-            debug_print('SonyUtilites:_on_device_connection_changed - Device disconnected')
-            self.connected_device_info = None
+            debug_print('Device disconnected')
+            self.current_device_info = None
             self.rebuild_menus()
 
 
     def _on_device_metadata_available(self):
-        self.plugin_device_metadata_available.emit()
-        self.connected_device_info = self.gui.device_manager.get_current_device_information().get('info', None)
-        location_info = self.connected_device_info[4]
-        debug_print('sonyutilities:_on_device_metadata_available - Metadata available:', location_info)
-        self.device   = self.get_device()
+        """
+        Whenever a device is plugged, this method is called..
         
-        for self.current_location in location_info.values():
+        If the device is a Sony, find the database paths (depends on whether an SD card is installed)
+        and back up all the databases (if necessary), then store bookmarks for any books you're reading 
+        (if STORE_ON_CONNECT is specified in the configuration)
+        
+        """
+        #TODO: no idea how to test job submission yet
+        
+        self.plugin_device_metadata_available.emit()
+        self.current_device_info = self.gui.device_manager.get_current_device_information().get('info', None)[4]
+        debug_print('Metadata available:', self.current_device_info)
+        self.device              = self.get_device()
+        self.device_database_path= self._device_database_paths()
+        
+        for location in self.current_device_info.values():
             if self.haveSony() and cfg.get_plugin_pref(cfg.BACKUP_OPTIONS_STORE_NAME, cfg.KEY_DO_DAILY_BACKUP):
-                debug_print('SonyUtilites:_on_device_metadata_available - About to start auto backup')
-                self.auto_backup_device_database()
+                debug_print('About to start auto backup')
+                self.auto_backup_device_database(location)
 
         if self.haveSony() and cfg.get_plugin_pref(cfg.COMMON_OPTIONS_STORE_NAME, cfg.KEY_STORE_ON_CONNECT):
-            debug_print('SonyUtilites:_on_device_metadata_available - About to start auto store')
+            debug_print('About to start auto store')
             self.auto_store_current_bookmark()
 
         self.rebuild_menus()
@@ -219,7 +226,7 @@ class sonyutilitiesAction(InterfaceAction):
 
             self.device   = self.get_device()
             haveSony      = self.haveSony()
-#             debug_print("rebuild_menus - self.supports_ratings=%s" % self.supports_ratings)
+#             debug_print("self.supports_ratings=%s" % self.supports_ratings)
 
             if haveSony:
                 self.set_reader_fonts_action = self.create_menu_item_ex(self.menu,  _("&Set Reader Font for Selected Books"), 
@@ -332,13 +339,12 @@ class sonyutilitiesAction(InterfaceAction):
                                                             is_device_action=True)
             self.databaseMenu = self.menu.addMenu(_("Database"))
             if haveSony:
-                self.block_analytics_action = self.create_menu_item_ex(self.databaseMenu,  _("Block Analytics Events"),
-                                                                unique_name='Block Analytics Events',
-                                                                shortcut_name= _("Block Analytics Events"),
-                                                                triggered=self.block_analytics,
-                                                                enabled=haveSony,
-                                                                is_library_action=True,
-                                                                is_device_action=True)
+#                 self.block_analytics_action = self.create_menu_item_ex(self.databaseMenu,  _("Block Analytics Events"),
+#                                                                 unique_name='Block Analytics Events',
+#                                                                 shortcut_name= _("Block Analytics Events"),
+#                                                                 enabled=haveSony,
+#                                                                 is_library_action=True,
+#                                                                 is_device_action=True)
                 self.databaseMenu.addSeparator()
                 self.fix_duplicate_shelves_action = self.create_menu_item_ex(self.databaseMenu,  _("Fix Duplicate Shelves"),
                                                                 unique_name='Fix Duplicate Shelves',
@@ -470,7 +476,7 @@ class sonyutilitiesAction(InterfaceAction):
             else:
                 button_action = cfg.get_plugin_pref(cfg.COMMON_OPTIONS_STORE_NAME, cfg.KEY_BUTTON_ACTION_LIBRARY)
                 if button_action == '':
-                    debug_print("toolbar_button_clicked - no button action")
+                    debug_print("no button action")
                     self.show_configuration()
                 else:
                     try:
@@ -495,10 +501,10 @@ class sonyutilitiesAction(InterfaceAction):
             rows = view.selectionModel().selectedRows()
             books = [view.model().db[view.model().map[r.row()]] for r in rows]
             contentIDs = [book.contentID for book in books]
-#            debug_print("_get_contentIDs_for_selected - book.ImageID=", book.ImageID)
+#            debug_print("book.ImageID=", book.ImageID)
         else:
             book_ids = view.get_selected_ids()
-            contentIDs = self.get_contentIDs_for_books(book_ids)
+            contentIDs = self.get_contentIDs_for_books(book_ids, view.model().db.prefix)
             
         return contentIDs
 
@@ -518,7 +524,7 @@ class sonyutilitiesAction(InterfaceAction):
 
         contentIDs = self._get_contentIDs_for_selected()
 
-        debug_print('set_reader_fonts - contentIDs', contentIDs)
+        debug_print('contentIDs', contentIDs)
 
         #print("update books:%s"%books)
 
@@ -575,7 +581,7 @@ class sonyutilitiesAction(InterfaceAction):
         import pydevd;pydevd.settrace() #TODO: pydevd
         if len(self.gui.current_view().selectionModel().selectedRows()) == 0:
             return
-        #debug_print("upload_covers - start")
+        debug_print("start")
         self.device = self.get_device()
         if self.device is None:
             return error_dialog(self.gui,  _("Cannot update metadata in device library."),
@@ -587,13 +593,13 @@ class sonyutilitiesAction(InterfaceAction):
         
         if len(selectedIDs) == 0:
             return
-        debug_print("update_metadata - selectedIDs:", selectedIDs)
+        debug_print("selectedIDs:", selectedIDs)
         books = self._convert_calibre_ids_to_books(self.gui.current_view().model().db, selectedIDs)
         for book in books:
             device_book_paths = self.get_device_paths_from_id(book.calibre_id)
-            debug_print("update_metadata - device_book_paths:", device_book_paths)
+            debug_print("device_book_paths:", device_book_paths)
             book.paths = device_book_paths
-            book.contentIDs = [self.contentid_from_path(path) for path in device_book_paths]
+            book.contentIDs = [book.contentID] if book.contentID is not None else self.get_contentIDs_from_id(book.calibre_id)
             book.series_index_string = None
         
         dlg = UpdateMetadataOptionsDialog(self.gui, self)
@@ -612,7 +618,7 @@ class sonyutilitiesAction(InterfaceAction):
     def handle_bookmarks(self):
         if len(self.gui.current_view().selectionModel().selectedRows()) == 0:
             return
-        #debug_print("upload_covers - start")
+        #debug_print("start")
         self.device = self.get_device()
         if self.device is None:
             return error_dialog(self.gui,  _("Cannot store or restore current reading position."),
@@ -638,7 +644,11 @@ class sonyutilitiesAction(InterfaceAction):
 
 
     def auto_store_current_bookmark(self):
-        debug_print("auto_store_current_bookmark - start")
+        """
+        Start a job to store all the bookmarks for books currently being read
+        """
+        #TODO: no idea how to test job submission yet
+        debug_print("start")
         db = self.gui.current_db
 
         self.options = {}
@@ -651,12 +661,11 @@ class sonyutilitiesAction(InterfaceAction):
         self.options[cfg.KEY_STORE_IF_MORE_RECENT]     = cfg.get_plugin_pref(cfg.COMMON_OPTIONS_STORE_NAME, cfg.KEY_STORE_IF_MORE_RECENT)
         self.options[cfg.KEY_DO_NOT_STORE_IF_REOPENED] = cfg.get_plugin_pref(cfg.COMMON_OPTIONS_STORE_NAME, cfg.KEY_DO_NOT_STORE_IF_REOPENED)
 
-        self.options["device_database_path"] = self.device_database_path()
-        self.options["job_function"]         = 'store_current_bookmark'
-        self.options["supports_ratings"]     = False
-        self.options['allOnDevice']          = True
-
-        # it takes forever to figure out that this actually calls dialogs.do_books to get the book list...
+        self.options["databases"]    = self.device_database_path
+        self.options["job_function"] = 'store_current_bookmark'
+        self.options['allOnDevice']  = True
+        
+        # it took forever to figure out that this actually calls dialogs.do_books to get the book list...
         QueueProgressDialog(self.gui, [], None, self.options, self._store_queue_job, db, plugin_action=self)
 
 
@@ -683,42 +692,40 @@ class sonyutilitiesAction(InterfaceAction):
         if not backup_file:
             return
 
-        debug_print("backup_device_database - backup file selected=", backup_file)
+        debug_print("backup file selected=", backup_file)
         # TODO: This needs to be fixed to work for both DBs
         source_file = self.device_database_path()
         shutil.copyfile(source_file, backup_file)
 
-    def auto_backup_device_database(self, from_menu=False):
-        debug_print('auto_backup_device_database - start')
+    def auto_backup_device_database(self, location, from_menu=False):
+        """
+        Every time a Sony reader is connected, back up its databases (limit of once per day)
+        """
+        #TODO: no idea how to test job submission yet
+        debug_print('start')
         
         self.device_path = self.get_device_path()
 
         dest_dir = cfg.get_plugin_pref(cfg.BACKUP_OPTIONS_STORE_NAME, cfg.KEY_BACKUP_DEST_DIRECTORY)
-        debug_print('auto_backup_device_database - destination directory=', dest_dir)
+        debug_print('destination directory=', dest_dir)
         if not dest_dir or len(dest_dir) == 0:
-            debug_print('auto_backup_device_database - destination directory not set, not doing backup')
+            debug_print('destination directory not set, not doing backup')
             return
         
-        # Backup file names will be devicename-location-uuid-timestamp
-        backup_file_template = '{0}-{1}-{2}-{3}'
-        backup_options = self.current_location
-        debug_print('auto_backup_device_database - device_information=', backup_options)
-
-        backup_options[cfg.KEY_BACKUP_DEST_DIRECTORY] = dest_dir
-        backup_options[cfg.KEY_BACKUP_COPIES_TO_KEEP] = cfg.get_plugin_pref(cfg.BACKUP_OPTIONS_STORE_NAME, cfg.KEY_BACKUP_COPIES_TO_KEEP)
-        backup_options['from_menu']                   = from_menu
-        backup_options['backup_file_template']        = backup_file_template
-        backup_options['database_file']               = self.device_database_path()
-        debug_print('auto_backup_device_database - backup_options=', backup_options)
-
-        self._device_database_backup(backup_options)
-        debug_print('auto_backup_device_database - end')
+        self._device_database_backup(from_menu  = from_menu,
+                                     dest       = dest_dir,
+                                     copies     = cfg.get_plugin_pref(cfg.BACKUP_OPTIONS_STORE_NAME, cfg.KEY_BACKUP_COPIES_TO_KEEP),
+                                     database_file = self.device_database_path[location['prefix']],
+                                     **location
+                                     )
+        debug_print('end')
 
 
     def store_current_bookmark(self):
+        # This is sooo not going to work on a Sony...
         if len(self.gui.current_view().selectionModel().selectedRows()) == 0:
             return
-        #debug_print("upload_covers - start")
+        #debug_print("start")
         self.device = self.get_device()
         if self.device is None:
             return error_dialog(self.gui,  _("Cannot update metadata in device library."),
@@ -726,12 +733,11 @@ class sonyutilitiesAction(InterfaceAction):
                     show=True)
         self.device_path = self.get_device_path()
 
-#         self.options["device_database_path"]       = self.device_database_path(location_info)
-        self.options["job_function"]               = 'store_current_bookmark'
-#         self.options["supports_ratings"]           = self.supports_ratings
-        self.options['allOnDevice']                = False
-        self.options[cfg.KEY_PROMPT_TO_STORE]      = True
-        debug_print("store_current_bookmark - self.options:", self.options)
+        self.options["job_function"]          = 'store_current_bookmark'
+        self.options["databases"]             = self.device_database_path
+        self.options['allOnDevice']           = False
+        self.options[cfg.KEY_PROMPT_TO_STORE] = True
+        debug_print("self.options:", self.options)
 
         if self.options[cfg.KEY_BACKGROUND_JOB]:
             QueueProgressDialog(self.gui, [], None, self.options, self._store_queue_job, self.gui.current_view().model().db, plugin_action=self)
@@ -740,13 +746,13 @@ class sonyutilitiesAction(InterfaceAction):
         
             if len(selectedIDs) == 0:
                 return
-            debug_print("store_current_bookmark - selectedIDs:", selectedIDs)
+            debug_print("selectedIDs:", selectedIDs)
             books = self._convert_calibre_ids_to_books(self.gui.current_view().model().db, selectedIDs)
             for book in books:
                 device_book_paths = self.get_device_paths_from_id(book.calibre_id)
-    #            debug_print("store_current_bookmark - device_book_paths:", device_book_paths)
+    #            debug_print("device_book_paths:", device_book_paths)
                 book.paths = device_book_paths
-                book.contentIDs = [self.contentid_from_path(path) for path in device_book_paths]
+                book.contentIDs = [book.contentID] if book.contentID is not None else self.get_contentIDs_from_id(book.calibre_id)
 
             books_with_bookmark, books_without_bookmark, count_books = self._store_current_bookmark(books)
             result_message = _("Update summary:") + "\n\t" + _("Bookmarks retrieved={0}\n\tBooks with no bookmarks={1}\n\tTotal books={2}").format(books_with_bookmark, books_without_bookmark, count_books)
@@ -757,7 +763,7 @@ class sonyutilitiesAction(InterfaceAction):
     def restore_current_bookmark(self):
         if len(self.gui.current_view().selectionModel().selectedRows()) == 0:
             return
-        #debug_print("upload_covers - start")
+        #debug_print("start")
         self.device = self.get_device()
         if self.device is None:
             return error_dialog(self.gui,  _("Cannot set bookmark in device library."),
@@ -769,13 +775,13 @@ class sonyutilitiesAction(InterfaceAction):
         
         if len(selectedIDs) == 0:
             return
-        debug_print("restore_current_bookmark - selectedIDs:", selectedIDs)
+        debug_print("selectedIDs:", selectedIDs)
         books = self._convert_calibre_ids_to_books(self.gui.current_view().model().db, selectedIDs)
         for book in books:
             device_book_paths = self.get_device_paths_from_id(book.calibre_id)
-            debug_print("store_current_bookmark - device_book_paths:", device_book_paths)
+            debug_print("device_book_paths:", device_book_paths)
             book.paths = device_book_paths
-            book.contentIDs = [self.contentid_from_path(path) for path in device_book_paths]
+            book.contentIDs = [book.contentID] if book.contentID is not None else self.get_contentIDs_from_id(book.calibre_id)
         
         updated_books, not_on_device_books, count_books = self._restore_current_bookmark(books)
         result_message = _("Update summary:") + "\n\t" + _("Books updated={0}\n\tBooks not on device={1}\n\tTotal books={2}").format(updated_books, not_on_device_books, count_books)
@@ -789,7 +795,7 @@ class sonyutilitiesAction(InterfaceAction):
     def change_reading_status(self):
         if len(self.gui.current_view().selectionModel().selectedRows()) == 0:
             return
-        #debug_print("upload_covers - start")
+        #debug_print("start")
         self.device = self.get_device()
         if self.device is None:
             return error_dialog(self.gui,  _("Cannot change reading status in device library."),
@@ -803,9 +809,9 @@ class sonyutilitiesAction(InterfaceAction):
             return
         for book in books:
 #            device_book_paths = self.get_device_paths_from_id(book.calibre_id)
-            debug_print("change_reading_status - book:", book)
+            debug_print("book:", book)
             book.contentIDs = [book.contentID]
-        debug_print("change_reading_status - books:", books)
+        debug_print("books:", books)
 
         dlg = ChangeReadingStatusOptionsDialog(self.gui, self)
         dlg.exec_()
@@ -827,7 +833,7 @@ class sonyutilitiesAction(InterfaceAction):
     def mark_not_interested(self):
         if len(self.gui.current_view().selectionModel().selectedRows()) == 0:
             return
-        #debug_print("upload_covers - start")
+        #debug_print("start")
         self.device = self.get_device()
         if self.device is None:
             return error_dialog(self.gui,  _("Cannot change reading status in device library."),
@@ -843,11 +849,11 @@ class sonyutilitiesAction(InterfaceAction):
         for book in books:
 #            device_book_paths = self.get_device_paths_from_id(book.calibre_id)
             if 'Recommendation' in book.device_collections:
-                debug_print("mark_not_interested - book:", book)
+                debug_print("book:", book)
                 book.contentIDs = [book.contentID]
                 recommendations.append(book)
-                debug_print("mark_not_interested - book.device_collections:", book.device_collections)
-        debug_print("mark_not_interested - recommendations:", recommendations)
+                debug_print("book.device_collections:", book.device_collections)
+        debug_print("recommendations:", recommendations)
         self.options = self.default_options()
         self.options['mark_not_interested'] = True
 
@@ -860,7 +866,7 @@ class sonyutilitiesAction(InterfaceAction):
 
     def show_books_not_in_database(self):
 
-        #debug_print("upload_covers - start")
+        #debug_print("start")
         self.device = self.get_device()
         if self.device is None:
             return error_dialog(self.gui,  _("Cannot list books not in device library."),
@@ -875,11 +881,11 @@ class sonyutilitiesAction(InterfaceAction):
 
         books_not_in_database = self._check_book_in_database(books)
 #        for book in books:
-#            debug_print("show_books_not_in_database - book.title='%s'" % book.title)
+#            debug_print("book.title='%s'" % book.title)
 #            if not book.contentID:
 #                books_not_in_database.append(book)
 #            else:
-#                debug_print("show_books_not_in_database - book.contentID='%s'" % book.contentID)
+#                debug_print("book.contentID='%s'" % book.contentID)
 
         dlg = ShowBooksNotInDeviceDatabaseDialog(self.gui, books_not_in_database)
         dlg.show()
@@ -887,7 +893,7 @@ class sonyutilitiesAction(InterfaceAction):
 
     def fix_duplicate_shelves(self):
 
-        #debug_print("fix_duplicate_shelves - start")
+        #debug_print("start")
         self.device = self.get_device()
         if self.device is None:
             return error_dialog(self.gui,  _("Cannot fix the duplicate shelves in the device library."),
@@ -899,10 +905,10 @@ class sonyutilitiesAction(InterfaceAction):
         dlg = FixDuplicateShelvesDialog(self.gui, self, shelves)
         dlg.exec_()
         if dlg.result() != dlg.Accepted:
-            debug_print("fix_duplicate_shelves - dialog cancelled")
+            debug_print("dialog cancelled")
             return
         self.options = dlg.options
-        debug_print("fix_duplicate_shelves - about to fix shelves - options=%s" % self.options)
+        debug_print("about to fix shelves - options=%s" % self.options)
 
         starting_shelves, shelves_removed, finished_shelves = self._remove_duplicate_shelves(shelves, self.options)
         result_message = _("Update summary:") + "\n\t" + _("Starting number of shelves={0}\n\tShelves removed={1}\n\tTotal shelves={2}").format(starting_shelves, shelves_removed, finished_shelves)
@@ -913,7 +919,7 @@ class sonyutilitiesAction(InterfaceAction):
 
     def order_series_shelves(self):
 
-        #debug_print("order_series_shelves - start")
+        #debug_print("start")
         self.device = self.get_device()
         if self.device is None:
             return error_dialog(self.gui,  _("Cannot order the series shelves in the device library."),
@@ -925,12 +931,12 @@ class sonyutilitiesAction(InterfaceAction):
         dlg = OrderSeriesShelvesDialog(self.gui, self, shelves)
         dlg.exec_()
         if dlg.result() != dlg.Accepted:
-            debug_print("order_series_shelves - dialog cancelled")
+            debug_print("dialog cancelled")
             return
         self.options = dlg.options
         shelves      = dlg.get_shelves()
-        debug_print("order_series_shelves - about to order shelves - options=%s" % self.options)
-        debug_print("order_series_shelves - shelves=", shelves)
+        debug_print("about to order shelves - options=%s" % self.options)
+        debug_print("shelves=", shelves)
 
         starting_shelves, shelves_ordered = self._order_series_shelves(shelves, self.options)
         result_message = _("Update summary:") + "\n\t" + _("Starting number of shelves={0}\n\tShelves reordered={1}").format(starting_shelves, shelves_ordered)
@@ -940,7 +946,7 @@ class sonyutilitiesAction(InterfaceAction):
 
 
     def check_device_database(self):
-        #debug_print("check_device_database - start")
+        #debug_print("start")
         self.device = self.get_device()
         if self.device is None:
             return error_dialog(self.gui,  _("Cannot check Sony device database."),
@@ -948,7 +954,8 @@ class sonyutilitiesAction(InterfaceAction):
                     show=True)
         self.device_path = self.get_device_path()
 
-        check_result = self._check_device_database()
+        #TODO: Why on earth do we need two identically named methods
+        check_result = check_device_database(self.device_database_path())
 
         check_result = _("Result of running 'PRAGMA integrity_check' on database on the Sony device:\n\n") + check_result
 
@@ -957,36 +964,8 @@ class sonyutilitiesAction(InterfaceAction):
         d.exec_()
 
 
-    def block_analytics(self):
-        debug_print("block_analytics - start")
-        self.device = self.get_device()
-        if self.device is None:
-            return error_dialog(self.gui,  _("Cannot block analytics events."), 
-                 _("No device connected."), show=True)
-        self.device_path = self.get_device_path()
-
-        debug_print("block_analytics")
-
-        dlg = BlockAnalyticsOptionsDialog(self.gui, self)
-        dlg.exec_()
-        if dlg.result() != dlg.Accepted:
-            return
-        self.options = dlg.options
-
-        block_analytics_result = self._block_analytics()
-        if block_analytics_result:
-            info_dialog(self.gui,  _("Sony Utilities") + " - " + _("Block Analytics Events"),
-                    block_analytics_result, show=True)
-        else:
-            result_message = _("Failed to block analytics events.")
-            d = ViewLog( _("Sony Utilities") + " - " + _("Block Analytics Events"),
-                    result_message, parent=self.gui)
-            d.setWindowIcon(self.qaction.icon())
-            d.exec_()
-
-    
     def vacuum_device_database(self):
-        debug_print("vacuum_device_database - start")
+        debug_print("start")
         self.device = self.get_device()
         if self.device is None:
             return error_dialog(self.gui,  _("Cannot compress Sony device database."),
@@ -994,23 +973,26 @@ class sonyutilitiesAction(InterfaceAction):
                     show=True)
         self.device_path = self.get_device_path()
 
-        uncompressed_db_size = os.path.getsize(self.device_database_path())
-        vacuum_result = self._vacuum_device_database()
+        uncompressed_db_size = 0
+        for database in self.device_database_path.values():
+            uncompressed_db_size += os.path.getsize(database)
+            vacuum_result = self._vacuum_device_database(database)
+    
+            if vacuum_result == '':
+                compressed_db_size = os.path.getsize(database)
+            else:
+                vacuum_result = _("Result of running 'vacuum' on database on the Sony device:\n\n") + vacuum_result
+    
+                d = ViewLog("Sony Utilities - Compress Device Database", vacuum_result, parent=self.gui)
+                d.setWindowIcon(self.qaction.icon())
+                d.exec_()
+                return
 
-        if vacuum_result == '':
-            compressed_db_size = os.path.getsize(self.device_database_path())
-            result_message = _("The database on the device has been compressed.\n\tOriginal size = {0}MB\n\tCompressed size = {1}MB").format("%.3f"%(uncompressed_db_size / 1024 / 1024), "%.3f"%(compressed_db_size / 1024 / 1024))
-            info_dialog(self.gui,  _("Sony Utilities") + " - " + _("Compress Device Database"),
-                    result_message,
-                    show=True)
-
-        else:
-            vacuum_result = _("Result of running 'vacuum' on database on the Sony device:\n\n") + vacuum_result
-
-            d = ViewLog("Sony Utilities - Compress Device Database", vacuum_result, parent=self.gui)
-            d.setWindowIcon(self.qaction.icon())
-            d.exec_()
-
+        result_message = _("The database on the device has been compressed.\n\tOriginal size = {0}MB\n\tCompressed size = {1}MB").format("%.3f"%(uncompressed_db_size / 1024 / 1024), "%.3f"%(compressed_db_size / 1024 / 1024))
+        info_dialog(self.gui,  _("Sony Utilities") + " - " + _("Compress Device Database"),
+                result_message,
+                show=True)
+        return
 
     def default_options(self):
         options = cfg.METADATA_OPTIONS_DEFAULTS
@@ -1032,17 +1014,17 @@ class sonyutilitiesAction(InterfaceAction):
         self.device_path = self.get_device_path()
 
         books = self._get_books_for_selected()
-        debug_print("manage_series_on_device - books[0].__class__=", books[0].__class__)
+        debug_print("books[0].__class__=", books[0].__class__)
 
         
         if len(books) == 0:
             return
         seriesBooks = [SeriesBook(book, series_columns) for book in books]
         seriesBooks = sorted(seriesBooks, key=lambda k: k.sort_key(sort_by_name=True))
-        debug_print("manage_series_on_device - seriesBooks[0]._mi.__class__=", seriesBooks[0]._mi.__class__)
-        debug_print("manage_series_on_device - seriesBooks[0]._mi.sony_series=", seriesBooks[0]._mi.sony_series)
-        debug_print("manage_series_on_device - seriesBooks[0]._mi.sony_series_number=", seriesBooks[0]._mi.sony_series_number)
-        debug_print("manage_series_on_device - books:", seriesBooks)
+        debug_print("seriesBooks[0]._mi.__class__=", seriesBooks[0]._mi.__class__)
+        debug_print("seriesBooks[0]._mi.sony_series=", seriesBooks[0]._mi.sony_series)
+        debug_print("seriesBooks[0]._mi.sony_series_number=", seriesBooks[0]._mi.sony_series_number)
+        debug_print("books:", seriesBooks)
 
         library_db = self.gui.library_view.model().db
         all_series = library_db.all_series()
@@ -1053,12 +1035,12 @@ class sonyutilitiesAction(InterfaceAction):
         if d.result() != d.Accepted:
             return
         
-        debug_print("manage_series_on_device - done series management - books:", seriesBooks)
+        debug_print("done series management - books:", seriesBooks)
 
         self.options = self.default_options()
         books = []
         for seriesBook in seriesBooks:
-            debug_print("manage_series_on_device - seriesBook._mi.contentID=", seriesBook._mi.contentID)
+            debug_print("seriesBook._mi.contentID=", seriesBook._mi.contentID)
             if seriesBook.is_title_changed() or seriesBook.is_pubdate_changed() or seriesBook.is_series_changed():
                 book = seriesBook._mi
                 book.series_index_string = seriesBook.series_index_string()
@@ -1070,18 +1052,18 @@ class sonyutilitiesAction(InterfaceAction):
                 self.options['title']          = self.options['title'] or seriesBook.is_title_changed()
                 self.options['series']         = self.options['series'] or seriesBook.is_series_changed()
                 self.options['published_date'] = self.options['published_date'] or seriesBook.is_pubdate_changed()
-                debug_print("manage_series_on_device - seriesBook._mi.__class__=", seriesBook._mi.__class__)
-                debug_print("manage_series_on_device - seriesBook.is_pubdate_changed()=%s"%seriesBook.is_pubdate_changed())
-                debug_print("manage_series_on_device - book.sony_series=", book.sony_series)
-                debug_print("manage_series_on_device - book.sony_series_number=", book.sony_series_number)
-                debug_print("manage_series_on_device - book.series=", book.series)
-                debug_print("manage_series_on_device - book.series_index=%s"%unicode(book.series_index))
+                debug_print("seriesBook._mi.__class__=", seriesBook._mi.__class__)
+                debug_print("seriesBook.is_pubdate_changed()=%s"%seriesBook.is_pubdate_changed())
+                debug_print("book.sony_series=", book.sony_series)
+                debug_print("book.sony_series_number=", book.sony_series_number)
+                debug_print("book.series=", book.series)
+                debug_print("book.series_index=%s"%unicode(book.series_index))
 
 
         if self.options['title'] or self.options['series'] or self.options['published_date']:
             updated_books, unchanged_books, not_on_device_books, count_books = self._update_metadata(books)
             
-            debug_print("manage_series_on_device - about to call sync_booklists")
+            debug_print("about to call sync_booklists")
     #        self.device.sync_booklists((self.gui.current_view().model().db, None, None))
             USBMS.sync_booklists(self.device, (self.gui.current_view().model().db, None, None))
             result_message = _("Update summary:") + "\n\t" + _("Books updated={0}\n\tUnchanged books={1}\n\tBooks not on device={2}\n\tTotal books={3}").format(updated_books, unchanged_books, not_on_device_books, count_books)
@@ -1120,7 +1102,7 @@ class sonyutilitiesAction(InterfaceAction):
     def upload_covers(self):
         if len(self.gui.current_view().selectionModel().selectedRows()) == 0:
             return
-        #debug_print("upload_covers - start")
+        #debug_print("start")
         self.device = self.get_device()
         if self.device is None:
             return error_dialog(self.gui,
@@ -1133,7 +1115,7 @@ class sonyutilitiesAction(InterfaceAction):
         
         if len(selectedIDs) == 0:
             return
-        debug_print("upload_covers - selectedIDs:", selectedIDs)
+        debug_print("selectedIDs:", selectedIDs)
         books = self._convert_calibre_ids_to_books(self.gui.current_view().model().db, selectedIDs)
         
         dlg = CoverUploadOptionsDialog(self.gui, self)
@@ -1151,14 +1133,14 @@ class sonyutilitiesAction(InterfaceAction):
     def remove_covers(self):
         if len(self.gui.current_view().selectionModel().selectedRows()) == 0:
             return
-        #debug_print("remove_covers - start")
+        #debug_print("start")
         self.device = self.get_device()
         if self.device is None:
             return error_dialog(self.gui,  _("Cannot remove covers."),
                      _("No device connected."),
                     show=True)
         self.device_path = self.get_device_path()
-        debug_print("remove_covers - self.device_path", self.device_path)
+        debug_print("self.device_path", self.device_path)
 
 #        contentIDs = self._get_contentIDs_for_selected()
         if self.gui.stack.currentIndex() == 0:
@@ -1188,14 +1170,14 @@ class sonyutilitiesAction(InterfaceAction):
     def test_covers(self):
         if len(self.gui.current_view().selectionModel().selectedRows()) == 0:
             return
-        #debug_print("remove_covers - start")
+        #debug_print("start")
         self.device = self.get_device()
         if self.device is None:
             return error_dialog(self.gui,  _("Cannot remove covers."),
                      _("No device connected."),
                     show=True)
         self.device_path = self.get_device_path()
-        debug_print("test_covers - self.device_path", self.device_path)
+        debug_print("self.device_path", self.device_path)
 
 #        contentIDs = self._get_contentIDs_for_selected()
         if self.gui.stack.currentIndex() == 0:
@@ -1226,7 +1208,7 @@ class sonyutilitiesAction(InterfaceAction):
     def getAnnotationForSelected(self):
         if len(self.gui.current_view().selectionModel().selectedRows()) == 0:
             return
-        #debug_print("upload_covers - start")
+        #debug_print("start")
         self.device = self.get_device()
         if self.device is None:
             return error_dialog(self.gui,
@@ -1243,50 +1225,13 @@ class sonyutilitiesAction(InterfaceAction):
             return []
         return map(self.gui.current_view().model().id, rows)
 
-    def contentid_from_path(self, path):
-        debug_print("sonyutilities.action:contentid_from_path - self.device._main_prefix='%s'"%self.device._main_prefix, "self.device.device._card_a_prefix='%s'"%self.device._card_a_prefix)
-        # Remove the prefix on the file.  it could be either
-        if path.startswith(self.device._main_prefix):
-            internal_path = path.replace(self.device._main_prefix, '')
-            db = self.device_database_path(self.device._main_prefix)
-        else:
-            internal_path = path.replace(self.device._card_a_prefix, "")
-            db = self.device_database_path(self.device._card_a_prefix)
-        
-        import sqlite3 
-        with closing(sqlite3.connect(db)) as connection:
-            # return bytestrings if the content cannot the decoded as unicode
-            connection.text_factory = lambda x: unicode(x, "utf-8", "ignore")
-
-            query = 'SELECT _id FROM books WHERE file_path = ?'
-            cursor = connection.cursor()
-            cursor.execute(query, (internal_path,))
-            row = cursor.fetchone()
-            ContentID = row[0]
-            cursor.close()
-
-#        debug_print("sonyutilities.action:contentid_from_path - end - ContentID='%s'"%ContentID)
-        return ContentID
-
-    def get_contentIDs_for_books(self, ids):
-        contentIDs= []
-        for book_id in ids:
-            device_book_path = self.get_device_path_from_id(book_id)
-            debug_print('get_contentIDs_for_books - device_book_path', device_book_path)
-            if device_book_path is None:
-                continue
-            contentID = self.contentid_from_path(device_book_path)
-            debug_print('get_contentIDs_for_books - contentID', contentID)
-            contentIDs.append(contentID)
-        return contentIDs
-
     def _get_books_for_selected(self):
         view = self.gui.current_view()
         if self.isDeviceView():
             rows  = view.selectionModel().selectedRows()
             books = []
             for r in rows:
-#                debug_print('_get_books_for_selected - r.row()', r.row())
+#                debug_print('r.row()', r.row())
                 book = view.model().db[view.model().map[r.row()]]
                 book.calibre_id = r.row()
                 books.append(book)
@@ -1300,15 +1245,15 @@ class sonyutilitiesAction(InterfaceAction):
         books = []
         for book_id in ids:
             book = self._convert_calibre_id_to_book(db, book_id)
-#            debug_print('_convert_calibre_ids_to_books - book', book)
+#            debug_print('book', book)
             books.append(book)
         return books
 
     def _convert_calibre_id_to_book(self, db, book_id):
         mi = db.get_metadata(book_id, index_is_id=True, get_cover=True)
-#        debug_print('_convert_calibre_id_to_book - mi', mi)
-#        debug_print('_convert_calibre_id_to_book - mi.application_id', mi.application_id)
-#        debug_print('_convert_calibre_id_to_book - mi.in_library', mi.in_library)
+#        debug_print('mi', mi)
+#        debug_print('mi.application_id', mi.application_id)
+#        debug_print('mi.in_library', mi.in_library)
         book = Book('', 'lpath', other=mi)
         book.calibre_id  = mi.id
 
@@ -1357,19 +1302,16 @@ class sonyutilitiesAction(InterfaceAction):
             self.device = None
     
         # If there is a device connected, test if we can retrieve the mount point from Calibre
-        if self.device is None or not isinstance(self.device, PRST1):
-            debug_print('No Sony PRS device appears to be connected')
-        else:
+        if self.haveSony:
             debug_print('Have a Sony device connected')
+        else:
+            debug_print('No Sony PRS device appears to be connected')
 
         self.supports_series  = True
 
         debug_print('END Get Device')
         return self.device
     
-    def device_fwversion(self):
-        return self.device.fwversion
-
     def get_device_path_from_id(self, book_id):
         paths = self.get_device_paths_from_id(book_id)
         return paths[0] if paths else None
@@ -1380,25 +1322,67 @@ class sonyutilitiesAction(InterfaceAction):
         for x in ('memory', 'card_a', 'card_b'):
             x = getattr(self.gui, x+'_view').model()
             paths += x.paths_for_db_ids(set([book_id]), as_map=True)[book_id]
-#        debug_print("get_device_paths_from_id - paths=", paths)
+#        debug_print("paths=", paths)
         return [r.path for r in paths]
 
-    def get_contentIDs_from_id(self, book_id):
-        debug_print("get_contentIDs_from_id - book_id=", book_id)
-        paths = []
-        import pydevd;pydevd.settrace()
-        for x in ('memory', 'card_a', 'card_b'):
-#            debug_print("get_contentIDs_from_id - x=", x)
-            x = getattr(self.gui, x+'_view').model()
-#            debug_print("get_contentIDs_from_id - x=", x)
-            paths += x.paths_for_db_ids(set([book_id]), as_map=True)[book_id]
-        debug_print("get_contentIDs_from_id - paths=", paths)
-#        return [r.contentID if r.contentID else self.contentid_from_path(r.path) for r in paths]
-        return [r.contentID for r in paths]
+#     def get_contentIDs_from_id(self, book_id):
+#         import pydevd;pydevd.settrace()
+#         debug_print("book_id=", book_id)
+#         paths = []
+#         for x in ('memory', 'card_a', 'card_b'):
+#             x = getattr(self.gui, x+'_view').model()
+#             paths += x.paths_for_db_ids(set([book_id]), as_map=True)[book_id]
+#         debug_print("paths=", paths)
+#         return [r.contentID for r in paths]
+
+    def get_contentID_from_path(self, path, cursors):
+        debug_print("self.device._main_prefix='%s'"%self.device._main_prefix, "self.device.device._card_a_prefix='%s'"%self.device._card_a_prefix)
+        # Remove the prefix on the file.  it could be either
+        ignore, prefix, internal_path = path.rpartition(self.device._main_prefix) 
+        if prefix == '':
+            ignore, prefix, internal_path = path.rpartition(self.device._card_a_prefix) 
+        
+        cursor = cursors[prefix]
+        
+        query = 'SELECT _id FROM books WHERE file_path = ?'
+        cursor.execute(query, (internal_path,))
+        row = cursor.fetchone()
+        ContentID = row[0]
+
+#        debug_print("end - ContentID='%s'"%ContentID)
+        return ContentID
+
+    def get_contentIDs_for_books(self, ids, prefix=None):
+        """
+        Given a list of Calibre IDs, return the corresponding Sony database IDs
+        
+        calibre has registered where it put the file, but doesn't know anything
+        about how the Sony has catalogued it, so interrogate the device database
+        (this function is only called for a single device)
+        
+        >>> print(action.get_contentIDs_for_books([1,2,3]), 'main')
+        [2,4,6]
+        
+        I'm honestly unsure how useful this method is.  We often need to know all the content IDs for 
+        a single book, but I don't think we need a list of all content IDs without knowing which card
+        they're on 
+        """
+        contentIDs= []
+        database = {prefix: self.device_database_paths[prefix]}
+        with closing(SonyDB(database)) as cursors:
+            for book_id in ids:
+                device_book_path = self.get_device_path_from_id(book_id)
+                debug_print('device_book_path', device_book_path)
+                if device_book_path is None:
+                    continue
+                contentID = self.get_contentID_from_path(device_book_path, cursors)
+                debug_print('contentID', contentID)
+                contentIDs.append(contentID)
+        return contentIDs
 
 
     def _store_queue_job(self, tdir, options, books_to_modify):
-        debug_print("sonyutilitiesAction::_store_queue_job")
+        debug_print("")
         if not books_to_modify:
             # All failed so cleanup our temp directory
             remove_dir(tdir)
@@ -1419,7 +1403,7 @@ class sonyutilitiesAction(InterfaceAction):
             self.gui.job_exception(job, dialog_title=_('Failed to get reading positions'))
             return
         modified_epubs_map, options = job.result
-        debug_print("sonyutilitiesAction::_store_completed - options", options)
+        debug_print("options", options)
 
         update_count = len(modified_epubs_map) if modified_epubs_map else 0
         if update_count == 0:
@@ -1438,15 +1422,15 @@ class sonyutilitiesAction(InterfaceAction):
                 dlg = ShowReadingPositionChangesDialog(self.gui, self, job.result, db)
                 dlg.exec_()
                 if dlg.result() != dlg.Accepted:
-                    debug_print("_store_completed - dialog cancelled")
+                    debug_print("dialog cancelled")
                     return
                 modified_epubs_map = dlg.reading_locations
             self._update_database_columns(modified_epubs_map)
 
 
-    def _device_database_backup(self, backup_options):
-        debug_print("sonyutilitiesAction::_device_database_backup")
-
+    def _device_database_backup(self, **backup_options):
+        debug_print('device_information=', backup_options)
+        
 #        func = 'arbitrary_n'
 #         cpus = 1# self.gui.device_manager.server.pool_size
         from calibre_plugins.sonyutilities.jobs import do_device_database_backup
@@ -1465,9 +1449,9 @@ class sonyutilitiesAction(InterfaceAction):
 
     def _update_database_columns(self, reading_locations):
 #        reading_locations, options = payload
-#        debug_print("_store_current_bookmark - reading_locations=", reading_locations)
+#        debug_print("reading_locations=", reading_locations)
         
-        debug_print("_update_database_columns - start number of reading_locations= %d" % (len(reading_locations)))
+        debug_print("start number of reading_locations= %d" % (len(reading_locations)))
         pb = ProgressBar(parent=self.gui, window_title=_("Storing reading positions"), on_top=True)
         total_books = len(reading_locations)
         pb.set_maximum(total_books)
@@ -1483,11 +1467,11 @@ class sonyutilitiesAction(InterfaceAction):
         sony_percentRead_column = library_config.get(cfg.KEY_PERCENT_READ_CUSTOM_COLUMN, cfg.DEFAULT_LIBRARY_VALUES[cfg.KEY_PERCENT_READ_CUSTOM_COLUMN])
         last_read_column        = library_config.get(cfg.KEY_LAST_READ_CUSTOM_COLUMN, cfg.DEFAULT_LIBRARY_VALUES[cfg.KEY_LAST_READ_CUSTOM_COLUMN])
         if sony_bookmark_column:
-            debug_print("_update_database_columns - sony_bookmark_column=", sony_bookmark_column)
+            debug_print("sony_bookmark_column=", sony_bookmark_column)
             sony_bookmark_col = custom_cols[sony_bookmark_column]
-#                debug_print("_update_database_columns - sony_bookmark_col=", sony_bookmark_col)
+#                debug_print("sony_bookmark_col=", sony_bookmark_col)
             sony_bookmark_col_label = library_db.field_metadata.key_to_label(sony_bookmark_column)
-            debug_print("_update_database_columns - sony_bookmark_col_label=", sony_bookmark_col_label)
+            debug_print("sony_bookmark_col_label=", sony_bookmark_col_label)
         if sony_percentRead_column:
             sony_percentRead_col = custom_cols[sony_percentRead_column]
 #            sony_percentRead_col_label = library_db.field_metadata.key_to_label(sony_percentRead_column)
@@ -1496,10 +1480,10 @@ class sonyutilitiesAction(InterfaceAction):
             last_read_col = custom_cols[last_read_column]
 #            last_read_col_label = library_db.field_metadata.key_to_label(last_read_column)
 
-        debug_print("_update_database_columns - sony_bookmark_column=", sony_bookmark_column)
-        debug_print("_update_database_columns - sony_percentRead_column=", sony_percentRead_column) 
-#         debug_print("_update_database_columns - rating_column=", rating_column) 
-        debug_print("_update_database_columns - last_read_column=", last_read_column) 
+        debug_print("sony_bookmark_column=", sony_bookmark_column)
+        debug_print("sony_percentRead_column=", sony_percentRead_column) 
+#         debug_print("rating_column=", rating_column) 
+        debug_print("last_read_column=", last_read_column) 
         # At this point we want to re-use code in edit_metadata to go ahead and
         # apply the changes. So we will create empty Metadata objects so only
         # the custom column field gets updated
@@ -1518,12 +1502,12 @@ class sonyutilitiesAction(InterfaceAction):
             sony_percentRead = None
             last_read        = None
             if reading_location is not None: 
-                debug_print("_update_database_columns - result=", reading_location)
+                debug_print("result=", reading_location)
                 sony_bookmark = reading_location['mark']
                 sony_percentRead = reading_location['percent']
-#                 debug_print("_update_database_columns - reading_location[5]=", reading_location[5])
+#                 debug_print("reading_location[5]=", reading_location[5])
                 last_read = reading_location['reading_time']
-#                 debug_print("_update_database_columns - last_read=", last_read)
+#                 debug_print("last_read=", last_read)
 
             elif self.options[cfg.KEY_CLEAR_IF_UNREAD]:
 #                books_with_bookmark      += 1
@@ -1534,15 +1518,15 @@ class sonyutilitiesAction(InterfaceAction):
 #                books_without_bookmark += 1
                 continue
             
-            debug_print("_update_database_columns - sony_bookmark='%s'" % (sony_bookmark))
-            debug_print("_update_database_columns - sony_percentRead=", sony_percentRead)
+            debug_print("sony_bookmark='%s'" % (sony_bookmark))
+            debug_print("sony_percentRead=", sony_percentRead)
             if sony_bookmark_column:
                 if sony_bookmark:
                     new_value = sony_bookmark
                 else:
                     sony_bookmark_col['#value#'] = None
                     new_value        = None
-#                    debug_print("_update_database_columns - setting bookmark column to None")
+#                    debug_print("setting bookmark column to None")
                 sony_bookmark_col['#value#'] = new_value
                 if not hasattr(db, 'new_api'):
                     mi.set_user_metadata(sony_bookmark_column, sony_bookmark_col)
@@ -1554,47 +1538,47 @@ class sonyutilitiesAction(InterfaceAction):
 
             if sony_percentRead_column:
                 sony_percentRead_col['#value#'] = sony_percentRead
-                debug_print("_update_database_columns - setting mi.sony_percentRead=", sony_percentRead)
+                debug_print("setting mi.sony_percentRead=", sony_percentRead)
 #                library_db.set_custom(book.calibre_id, sony_percentRead, label=sony_percentRead_col_label, commit=False)
                 if not hasattr(db, 'new_api'):
                     mi.set_user_metadata(sony_percentRead_column, sony_percentRead_col)
                 current_percentRead = book.get_user_metadata(sony_percentRead_column, True)['#value#']
-                debug_print("_update_database_columns - percent read - in book=", current_percentRead)
+                debug_print("percent read - in book=", current_percentRead)
                 if not current_percentRead == sony_percentRead:
                     id_map_percentRead[book_id] = sony_percentRead
 
             if last_read_column:
                 current_last_read = book.get_user_metadata(last_read_column, True)['#value#']
                 last_read_col['#value#'] = last_read
-                debug_print("_update_database_columns - last_read=", last_read)
+                debug_print("last_read=", last_read)
                 if not hasattr(db, 'new_api'):
                     mi.set_user_metadata(last_read_column, last_read_col)
                 if not current_last_read == last_read:
                     id_map_last_read[book_id] = last_read
 
-#            debug_print("_update_database_columns - mi=", mi)
+#            debug_print("mi=", mi)
             id_map[book_id] = mi
 
         if hasattr(db, 'new_api'):
             if sony_bookmark_column:
-                debug_print("_update_database_columns - Updating metadata - for column: %s number of changes=%d" % (sony_bookmark_column, len(id_map_bookmark)))
+                debug_print("Updating metadata - for column: %s number of changes=%d" % (sony_bookmark_column, len(id_map_bookmark)))
                 library_db.new_api.set_field(sony_bookmark_column, id_map_bookmark)
             if sony_percentRead_column:
-                debug_print("_update_database_columns - Updating metadata - for column: %s number of changes=%d" % (sony_percentRead_column, len(id_map_percentRead)))
+                debug_print("Updating metadata - for column: %s number of changes=%d" % (sony_percentRead_column, len(id_map_percentRead)))
                 library_db.new_api.set_field(sony_percentRead_column, id_map_percentRead)
             if last_read_column:
-                debug_print("_update_database_columns - Updating metadata - for column: %s number of changes=%d" % (last_read_column, len(id_map_last_read)))
+                debug_print("Updating metadata - for column: %s number of changes=%d" % (last_read_column, len(id_map_last_read)))
                 library_db.new_api.set_field(last_read_column, id_map_last_read)
 
         
         if hasattr(db, 'new_api'):
-            debug_print("_update_database_columns - Updating GUI - new DB engine")
+            debug_print("Updating GUI - new DB engine")
             self.gui.iactions['Edit Metadata'].refresh_gui(list(reading_locations))
         else:
             edit_metadata_action = self.gui.iactions['Edit Metadata']
-            debug_print("_update_database_columns - Updating GUI - old DB engine")
+            debug_print("Updating GUI - old DB engine")
             edit_metadata_action.apply_metadata_changes(id_map)
-        debug_print("_update_database_columns - finished")
+        debug_print("finished")
 
         pb.hide()
         self.gui.status_bar.show_message(_('Sony Utilities') + ' - ' + _('Storing reading positions completed - {0} changed.').format(len(reading_locations)), 3000)
@@ -1630,7 +1614,7 @@ class sonyutilitiesAction(InterfaceAction):
             path_map = {}
             for _id in ids:
                 paths = self.get_device_paths_from_id(_id)
-                debug_print("generate_annotation_paths - paths=", paths)
+                debug_print("paths=", paths)
 #                mi = db.get_metadata(_id, index_is_id=True)
 #                a_path = device.create_annotations_path(mi, device_path=paths)
                 if len(paths) > 0:
@@ -1656,10 +1640,10 @@ class sonyutilitiesAction(InterfaceAction):
                      _("No books selected to fetch annotations from"),
                     show=True)
 
-        debug_print("_getAnnotationForSelected - ids=", ids)
+        debug_print("ids=", ids)
         # Map ids to paths
         path_map = generate_annotation_paths(ids, db, self.device)
-        debug_print("_getAnnotationForSelected - path_map=", path_map)
+        debug_print("path_map=", path_map)
         if len(path_map) == 0:
             return error_dialog(self.gui,  _("No books on device selected"),
                      _("None of the books selected were on the device. Annotations can only be copied for books on the device."),
@@ -1669,9 +1653,9 @@ class sonyutilitiesAction(InterfaceAction):
         from calibre.ebooks.metadata import authors_to_string
 
         # Dispatch to the device get_annotations()
-        debug_print("_getAnnotationForSelected - path_map=", path_map)
+        debug_print("path_map=", path_map)
         bookmarked_books = self.device.get_annotations(path_map)
-        debug_print("_getAnnotationForSelected - bookmarked_books=", bookmarked_books)
+        debug_print("bookmarked_books=", bookmarked_books)
 
         for id_ in bookmarked_books.keys():
             bm = self.device.UserAnnotation(bookmarked_books[id_][0], bookmarked_books[id_][1])
@@ -1706,12 +1690,12 @@ class sonyutilitiesAction(InterfaceAction):
 
         for book in books:
             total_books += 1
-            debug_print("_upload_covers - book=", book)
-            debug_print("_upload_covers - thumbnail=", book.thumbnail)
+            debug_print("book=", book)
+            debug_print("thumbnail=", book.thumbnail)
             paths = self.get_device_paths_from_id(book.calibre_id)
             not_on_device_books -= 1 if len(paths) > 0 else 0
             for path in paths:
-                debug_print("_upload_covers - path=", path)
+                debug_print("path=", path)
                 self.device.upload_cover(None, None, book, path)
 #                 self.device._upload_cover(path, '', book, path, self.options['blackandwhite'], keep_cover_aspect=self.options['keep_cover_aspect'])
                 uploaded_covers += 1
@@ -1720,7 +1704,6 @@ class sonyutilitiesAction(InterfaceAction):
 
 
     def _remove_covers(self, books):
-        import sqlite3 
         with closing(sqlite3.connect(self.device_database_path())) as connection:
             # return bytestrings if the content cannot the decoded as unicode
             connection.text_factory = lambda x: unicode(x, "utf-8", "ignore")
@@ -1735,15 +1718,15 @@ class sonyutilitiesAction(InterfaceAction):
             cursor = connection.cursor()
 
             for book in books:
-                debug_print("_remove_covers - book=", book)
-                debug_print("_remove_covers - book.__class__=", book.__class__)
-                debug_print("_remove_covers - book.contentID=", book.contentID)
-                debug_print("_remove_covers - book.lpath=", book.lpath)
-                debug_print("_remove_covers - book.path=", book.path)
+                debug_print("book=", book)
+                debug_print("book.__class__=", book.__class__)
+                debug_print("book.contentID=", book.contentID)
+                debug_print("book.lpath=", book.lpath)
+                debug_print("book.path=", book.path)
                 contentIDs = [book.contentID] if book.contentID is not None else self.get_contentIDs_from_id(book.calibre_id)
-                debug_print("_remove_covers - contentIDs=", contentIDs)
+                debug_print("contentIDs=", contentIDs)
                 for contentID in contentIDs:
-                    debug_print("_remove_covers - contentID=", contentID)
+                    debug_print("contentID=", contentID)
 
                     if book.lpath.startswith(self.device._card_a_prefix):
                         path = self.device._card_a_prefix
@@ -1754,11 +1737,11 @@ class sonyutilitiesAction(InterfaceAction):
                     cursor.execute(imageId_query, query_values)
                     result = cursor.fetchone()
                     if result is not None:
-                        debug_print("_remove_covers - contentId='%s', imageId='%s'" % (contentID, result[0]))
+                        debug_print("contentId='%s', imageId='%s'" % (contentID, result[0]))
                         self.device.delete_images(result[0], path)
                         removed_covers +=1
                     else:
-                        debug_print("_remove_covers - no match for contentId='%s'" % (contentID,))
+                        debug_print("no match for contentId='%s'" % (contentID,))
                         not_on_device_books += 1
                     connection.commit()
                     total_books += 1
@@ -1769,9 +1752,6 @@ class sonyutilitiesAction(InterfaceAction):
 
 
     def _test_covers(self, books):
-
-
-        import sqlite3 
         with closing(sqlite3.connect(self.device_database_path())) as connection:
             # return bytestrings if the content cannot the decoded as unicode
             connection.text_factory = lambda x: unicode(x, "utf-8", "ignore")
@@ -1786,15 +1766,15 @@ class sonyutilitiesAction(InterfaceAction):
             cursor = connection.cursor()
 
             for book in books:
-                debug_print("_test_covers - book=", book)
-                debug_print("_test_covers - book.__class__=", book.__class__)
-                debug_print("_test_covers - book.contentID=", book.contentID)
-                debug_print("_test_covers - book.lpath=", book.lpath)
-                debug_print("_test_covers - book.path=", book.path)
+                debug_print("book=", book)
+                debug_print("book.__class__=", book.__class__)
+                debug_print("book.contentID=", book.contentID)
+                debug_print("book.lpath=", book.lpath)
+                debug_print("book.path=", book.path)
                 contentIDs = [book.contentID] if book.contentID is not None else self.get_contentIDs_from_id(book.calibre_id)
-                debug_print("_test_covers - contentIDs=", contentIDs)
+                debug_print("contentIDs=", contentIDs)
                 for contentID in contentIDs:
-                    debug_print("_test_covers - contentID=", contentID)
+                    debug_print("contentID=", contentID)
                     
                     if book.lpath.startswith(self.device._card_a_prefix):
                         path = self.device._card_a_prefix
@@ -1805,22 +1785,22 @@ class sonyutilitiesAction(InterfaceAction):
                     cursor.execute(imageId_query, query_values)
                     result = cursor.fetchone()
                     if result is not None:
-                        debug_print("_test_covers - contentId='%s', imageId='%s'" % (contentID, result[0]))
+                        debug_print("contentId='%s', imageId='%s'" % (contentID, result[0]))
                         hash1 = qhash(result[0])
-#                        debug_print("_test_covers - hash1='%s'" % (hash1))
+#                        debug_print("hash1='%s'" % (hash1))
                         xff   = 0xff
                         dir1  = hash1 & xff
                         dir1  &= 0xff
-#                        debug_print("_test_covers - dir1='%s', xff='%s'" % (dir1, xff))
+#                        debug_print("dir1='%s', xff='%s'" % (dir1, xff))
                         xff00 = 0xff00
                         dir2  = (hash1 & xff00) >> 8
-#                        debug_print("_test_covers - hash1='%s', dir1='%s', dir2='%s'" % (hash1, dir1, dir2))
+#                        debug_print("hash1='%s', dir1='%s', dir2='%s'" % (hash1, dir1, dir2))
                         cover_dir = os.path.join(path, ".sony-images", "%s" % dir1, "%s" % dir2)
-                        debug_print("_test_covers - cover_dir='%s'" % (cover_dir))
+                        debug_print("cover_dir='%s'" % (cover_dir))
 #                        self.device.delete_images(result[0], path)
                         removed_covers +=1
                     else:
-                        debug_print("_test_covers - no match for contentId='%s'" % (contentID,))
+                        debug_print("no match for contentId='%s'" % (contentID,))
                         not_on_device_books += 1
                     connection.commit()
                     total_books += 1
@@ -1831,7 +1811,6 @@ class sonyutilitiesAction(InterfaceAction):
 
 
     def _get_imageid_set(self):
-        import sqlite3 
         with closing(sqlite3.connect(self.device_database_path())) as connection:
             # return bytestrings if the content cannot the decoded as unicode
             connection.text_factory = lambda x: unicode(x, "utf-8", "ignore")
@@ -1845,7 +1824,7 @@ class sonyutilitiesAction(InterfaceAction):
             cursor.execute(imageId_query)
             for row in cursor:
                 imageIDs.append(row[0])
-#                debug_print("_get_imageid_set - row[0]='%s'" % (row[0]))
+#                debug_print("row[0]='%s'" % (row[0]))
             connection.commit()
 
             cursor.close()
@@ -1854,27 +1833,22 @@ class sonyutilitiesAction(InterfaceAction):
 
 
     def _check_book_in_database(self, books):
-        import sqlite3 
-        with closing(sqlite3.connect(self.device_database_path())) as connection:
-            # return bytestrings if the content cannot the decoded as unicode
-            connection.text_factory = lambda x: unicode(x, "utf-8", "ignore")
-
+        with closing(SonyDB(self.device_database_path)) as cursors:
             not_on_device_books = []
 
-            # TODO: check return from self.contentid_from_path() - should return null for book not on device
+            # TODO: check return from self.get_contentID_from_path() - should return null for book not on device
             for book in books:
                 if not book.contentID:
-                    book.contentID = self.contentid_from_path(book.path)
+                    book.contentID = self.get_contentID_from_path(book.path, cursors)
 
                 if not book.contentID:
-                    debug_print("_check_book_in_database - no match for contentId='%s'" % (book.contentID,))
+                    debug_print("no match for contentId='%s'" % (book.contentID,))
                     not_on_device_books.append(book)
 
         return not_on_device_books
 
 
     def _get_shelf_count(self):
-        import sqlite3 
         with closing(sqlite3.connect(self.device_database_path())) as connection:
             # return bytestrings if the content cannot the decoded as unicode
             connection.text_factory = lambda x: unicode(x, "utf-8", "ignore")
@@ -1890,7 +1864,7 @@ class sonyutilitiesAction(InterfaceAction):
             cursor.execute(shelves_query)
     #        count_bookshelves = 0
             for i, row in enumerate(cursor):
-                debug_print("_get_shelf_count - row:", i, row[0], row[1], row[2], row[3])
+                debug_print("row:", i, row[0], row[1], row[2], row[3])
                 shelves.append([row[0], convert_sony_date(row[1]), convert_sony_date(row[2]), int(row[3]) ])
     
             cursor.close()
@@ -1898,8 +1872,7 @@ class sonyutilitiesAction(InterfaceAction):
 
 
     def _get_series_shelf_count(self, order_shelf_type):
-        debug_print("_get_series_shelf_count - order_shelf_type:", order_shelf_type)
-        import sqlite3 
+        debug_print("order_shelf_type:", order_shelf_type)
         with closing(sqlite3.connect(self.device_database_path())) as connection:
             # return bytestrings if the content cannot the decoded as unicode
             connection.text_factory = lambda x: unicode(x, "utf-8", "ignore")
@@ -1937,20 +1910,20 @@ class sonyutilitiesAction(InterfaceAction):
 
             shelves_queries= [series_query, authors_query, other_query, all_query]
             shelves_query = shelves_queries[order_shelf_type]
-            debug_print("_get_series_shelf_count - shelves_query:", shelves_query)
+            debug_print("shelves_query:", shelves_query)
 
             cursor = connection.cursor()
             cursor.execute(shelves_query)
     #        count_bookshelves = 0
             for i, row in enumerate(cursor):
-                debug_print("_get_series_shelf_count - row:", i, row[0], row[1])
+                debug_print("row:", i, row[0], row[1])
                 shelf = {}
                 shelf['name']  = row[0]
                 shelf['count'] = int(row[1])
                 shelves.append(shelf)
 
             cursor.close()
-        debug_print("_get_series_shelf_count - shelves:", shelves)
+        debug_print("shelves:", shelves)
         return shelves
 
 
@@ -1973,14 +1946,14 @@ class sonyutilitiesAction(InterfaceAction):
                 try:
                     if not char in URL_SAFE:
                         char = ("%%%02x" % ord(char)).upper()
-                        debug_print("urlquote - unsafe after ord char=", char)
+                        debug_print("unsafe after ord char=", char)
                 except:
                     char = "%%%02x" % ord(char).upper()
                 result.append(char)
             return ''.join(result)
 
 
-        debug_print("_order_series_shelves - shelves:", shelves, " options:", options)
+        debug_print("shelves:", shelves, " options:", options)
         import re
         from urllib import quote
 #        from calibre.ebooks.oeb.base import urlquote
@@ -2015,25 +1988,25 @@ class sonyutilitiesAction(InterfaceAction):
             cursor = connection.cursor()
             for shelf in shelves:
                 starting_shelves += 1
-                debug_print("_order_series_shelves - shelf=%s, count=%d" % (shelf['name'], shelf['count']))
+                debug_print("shelf=%s, count=%d" % (shelf['name'], shelf['count']))
                 if shelf['count'] <= 1:
                     continue
                 shelves_ordered += 1
                 shelf_data = (shelf['name'],)
-                debug_print("_order_series_shelves - shelf_data:", shelf_data)
+                debug_print("shelf_data:", shelf_data)
                 cursor.execute(shelves_query, shelf_data)
                 shelf_dict = {}
                 for i, row in enumerate(cursor):
-                    debug_print("_order_series_shelves - row:", i, row["ShelfName"], row["ContentId"], row['Series'], row["SeriesNumber"])
+                    debug_print("row:", i, row["ShelfName"], row["ContentId"], row['Series'], row["SeriesNumber"])
                     series_name = row['Series'] if row['Series'] else ''
                     try:
                         series_index = float(row["SeriesNumber"]) if row["SeriesNumber"] is not None else None
                     except:
-                        debug_print("_order_series_shelves - non numeric number")
+                        debug_print("non numeric number")
                         numbers = re.findall(r"\d*\.?\d+", row["SeriesNumber"])
                         if len(numbers) > 0:
                             series_index = float(numbers[0])
-                    debug_print("_order_series_shelves - series_index=", series_index)
+                    debug_print("series_index=", series_index)
 #                    series_index_str = "%10.4f"%series_index if series_index else ''
 #                    sort_str = series_name + series_index_str + row['Title']
                     if order_by == cfg.KEY_ORDER_SHELVES_PUBLISHED:
@@ -2045,46 +2018,46 @@ class sonyutilitiesAction(InterfaceAction):
                         shelf_dict[sort_key].append(row['ContentId'])
                     else:
                         shelf_dict[sort_key] = [row['ContentId']]
-                debug_print("_order_series_shelves - shelf_dict:", shelf_dict)
+                debug_print("shelf_dict:", shelf_dict)
                 
-                debug_print("_order_series_shelves - sorted shelf_dict:", sorted(shelf_dict))
+                debug_print("sorted shelf_dict:", sorted(shelf_dict))
                 
                 lastModifiedTime = datetime.fromtimestamp(time.mktime(time.gmtime()))
                 
-                debug_print("_order_series_shelves - lastModifiedTime=", lastModifiedTime, " timeDiff:", timeDiff)
+                debug_print("lastModifiedTime=", lastModifiedTime, " timeDiff:", timeDiff)
                 for sort_key in sorted(shelf_dict, reverse=sort_descending):
                     for contentId in shelf_dict[sort_key]:
                         update_data = (strftime(self.device_timestamp_string(), lastModifiedTime.timetuple()), shelf['name'], contentId)
-                        debug_print("_order_series_shelves - sort_key: ", sort_key,  " update_data:", update_data)
+                        debug_print("sort_key: ", sort_key,  " update_data:", update_data)
                         cursor.execute(update_query, update_data)
                         lastModifiedTime += timeDiff
                 if update_config:
                     try:
                         shelf_key = quote("LastLibrarySorter_shelf_filterByBookshelf(" + shelf['name'] + ")")
                     except:
-                        debug_print("_order_series_shelves - cannot encode shelf name=", shelf['name'])
+                        debug_print("cannot encode shelf name=", shelf['name'])
                         if isinstance(shelf['name'], unicode):
-                            debug_print("_order_series_shelves - is unicode")
+                            debug_print("is unicode")
                             shelf_key = urlquote(shelf['name'])
                             shelf_key = quote("LastLibrarySorter_shelf_filterByBookshelf(") + shelf_key + quote(")")
                         else:
-                            debug_print("_order_series_shelves - not unicode")
+                            debug_print("not unicode")
                             shelf_key = "LastLibrarySorter_shelf_filterByBookshelf(" + shelf['name'] + ")"
                     sonyConfig.set('ApplicationPreferences', shelf_key , "sortByDateAddedToShelf()")
-#                    debug_print("_order_series_shelves - set shelf_key=", shelf_key)
+#                    debug_print("set shelf_key=", shelf_key)
 
             cursor.close()
             connection.commit()
             if update_config:
                 with open(config_file_path, 'wb') as config_file:
-                    debug_print("_order_series_shelves - writing config file")
+                    debug_print("writing config file")
                     sonyConfig.write(config_file)
-        debug_print("_order_series_shelves - end")
+        debug_print("end")
         return starting_shelves, shelves_ordered
 
 
     def _remove_duplicate_shelves(self, shelves, options):
-        debug_print("_remove_duplicate_shelves - total shelves=%d: options=%s" % (len(shelves), options))
+        debug_print("total shelves=%d: options=%s" % (len(shelves), options))
         import sqlite3 
         with closing(sqlite3.connect(self.device_database_path())) as connection:
             # return bytestrings if the content cannot the decoded as unicode
@@ -2128,22 +2101,22 @@ class sonyutilitiesAction(InterfaceAction):
                 starting_shelves += shelf[3]
                 finished_shelves += 1
                 if shelf[3] > 1:
-                    debug_print("_remove_duplicate_shelves - shelf:", shelf[0], shelf[1], shelf[2], shelf[3])
+                    debug_print("shelf:", shelf[0], shelf[1], shelf[2], shelf[3])
                     timestamp = shelf[2] if keep_newest else shelf[1]
                     shelves_values = (shelf[0], timestamp.strftime(self.device_timestamp_string()))
 
                     cursor.execute(shelves_query, shelves_values)
                     for row in cursor:
-                        debug_print("_remove_duplicate_shelves - row: ", row['Name'], row['CreationDate'], row['_IsDeleted'], row['_IsSynced'])
+                        debug_print("row: ", row['Name'], row['CreationDate'], row['_IsDeleted'], row['_IsSynced'])
 
                     shelves_update_values = (strftime(self.device_timestamp_string(), time.gmtime()), shelf[0], timestamp.strftime(self.device_timestamp_string()))
-                    debug_print("_remove_duplicate_shelves - marking as deleted:", shelves_update_values)
+                    debug_print("marking as deleted:", shelves_update_values)
                     cursor.execute(shelves_update, shelves_update_values)
                     cursor.execute(shelves_delete, shelves_values)
                     shelves_removed += shelf[3] - 1
 
             if purge_shelves:
-                debug_print("_remove_duplicate_shelves - purging all shelves marked as deleted")
+                debug_print("purging all shelves marked as deleted")
                 cursor.execute(shelves_purge)
 
             cursor.close()
@@ -2152,62 +2125,21 @@ class sonyutilitiesAction(InterfaceAction):
         return starting_shelves, shelves_removed, finished_shelves
 
 
-    def _check_device_database(self):
-        return check_device_database(self.device_database_path())
-
-
-    def _block_analytics(self):
-        import sqlite3 
-        with closing(sqlite3.connect(self.device_database_path())) as connection:
-            connection.text_factory = lambda x: unicode(x, "utf-8", "ignore")
-            cursor = connection.cursor()
-
-            block_result = "The trigger on the AnalyticsEvents table has been removed."
-
-            cursor.execute("DROP TRIGGER IF EXISTS BlockAnalyticsEvents")
-            # Delete the Extended drvier version if it is there.
-            cursor.execute("DROP TRIGGER IF EXISTS KTE_BlockAnalyticsEvents")
-
-            if self.options[cfg.KEY_CREATE_ANALYTICSEVENTS_TRIGGER]:
-                cursor.execute('DELETE FROM AnalyticsEvents')
-                debug_print("sonyutilities:_block_analytics - creating trigger.")
-                trigger_query = ('CREATE TRIGGER IF NOT EXISTS BlockAnalyticsEvents '
-                                'AFTER INSERT ON AnalyticsEvents '
-                                'BEGIN '
-                                'DELETE FROM AnalyticsEvents; '
-                                'END'
-                                )
-                cursor.execute(trigger_query)
-                result = cursor.fetchall()
-
-                if result is None:
-                    block_result = None
-                else:
-                    debug_print("_block_analytics - result=", result)
-                    block_result = "AnalyticsEvents have been blocked in the database."
-
-            connection.commit()
-            cursor.close()
-        return block_result
-
-
-    def _vacuum_device_database(self):
-        import sqlite3 
-        with closing(sqlite3.connect(self.device_database_path())) as connection:
+    def _vacuum_device_database(self, database):
+        with closing(sqlite3.connect(database)) as connection:
             # return bytestrings if the content cannot the decoded as unicode
             connection.text_factory = lambda x: unicode(x, "utf-8", "ignore")
-
-            compress_query = 'VACUUM'
             cursor = connection.cursor()
 
+            compress_query  = 'VACUUM'
             compress_result = ''
             cursor.execute(compress_query)
             result = cursor.fetchall()
             if not result is None:
-                debug_print("_vacuum_device_database - result=", result)
+                debug_print("result=", result)
                 for line in result:
                     compress_result += '\n' + line[0]
-                    debug_print("_vacuum_device_database - result line=", line[0])
+                    debug_print("result line=", line[0])
             else:
                 compress_result = _("Execution of '%s' failed") % compress_query
 
@@ -2219,13 +2151,13 @@ class sonyutilitiesAction(InterfaceAction):
 
 
     def generate_metadata_query(self):
-        debug_print("generate_metadata_query - self.supports_series=", self.supports_series)
+        debug_print("self.supports_series=", self.supports_series)
         test_query = 'SELECT Title,   '\
                     '    Attribution, '\
                     '    Description, '\
                     '    Publisher,   '
         if self.supports_series:
-            debug_print("generate_metadata_query - supports series is true")
+            debug_print("supports series is true")
             test_query += ' Series,       '\
                           ' SeriesNumber, '\
                           ' Subtitle, '
@@ -2247,7 +2179,7 @@ class sonyutilitiesAction(InterfaceAction):
 
         test_query += 'WHERE c1.BookId IS NULL '  \
                       'AND c1.ContentId = ?'
-        debug_print("generate_metadata_query - test_query=%s" % test_query)
+        debug_print("test_query=%s" % test_query)
         return test_query
 
     def _update_metadata(self, books):
@@ -2265,30 +2197,28 @@ class sonyutilitiesAction(InterfaceAction):
         debug_print("update_metadata: self.device.__class__.__name__=", self.device.__class__.__name__)
 
         library_db     = self.gui.current_db
-        library_config = cfg.get_library_config(library_db)
-#         rating_column  = library_config.get(cfg.KEY_RATING_CUSTOM_COLUMN, cfg.DEFAULT_LIBRARY_VALUES[cfg.KEY_RATING_CUSTOM_COLUMN])
+        cfg.get_library_config(library_db)
 
-        import sqlite3 
-        with closing(sqlite3.connect(self.device_database_path())) as connection:
-            # return bytestrings if the content cannot the decoded as unicode
-            connection.text_factory = lambda x: unicode(x, "utf-8", "ignore")
-            connection.row_factory = sqlite3.Row
-
+        with closing(SonyDB(self.device_database_path)) as cursors:
             test_query = self.generate_metadata_query()
-            cursor = connection.cursor()
-
+            
             for book in books:
 #                device_book_paths = self.get_device_paths_from_id(book.id)
                 for contentID in book.contentIDs:
-                    debug_print("_update_metadata - searching for contentId='%s'" % (contentID))
+                    debug_print("searching for contentId='%s'" % (contentID))
                     if not contentID:
-                        contentID = self.contentid_from_path(book.path)
+                        contentID = self.get_contentID_from_path(book.path, cursors)
+                    if book.path.startswith(self.device._main_prefix):
+                        cursor = cursors(self.device._main_prefix) 
+                    else:
+                        cursor = cursors(self.device._card_a_prefix) 
+        
                     count_books += 1
                     query_values = (contentID,)
                     cursor.execute(test_query, query_values)
                     result = cursor.fetchone()
                     if result is not None:
-                        debug_print("_update_metadata - found contentId='%s'" % (contentID))
+                        debug_print("found contentId='%s'" % (contentID))
 #                        debug_print("    result=", result)
 #                        debug_print("    result.keys()=", result.keys())
 #                        debug_print("    result[0]=", result[0])
@@ -2303,7 +2233,7 @@ class sonyutilitiesAction(InterfaceAction):
                         authors_string = None
                         if self.options[cfg.KEY_USE_PLUGBOARD] and plugboards is not None:
                             book_format = os.path.splitext(contentID)[1][1:]
-                            debug_print("_update_metadata - format='%s'" % (book_format))
+                            debug_print("format='%s'" % (book_format))
                             plugboard = find_plugboard(self.device.__class__.__name__,
                                                        book_format, plugboards)
                             debug_print("update_metadata: plugboard=", plugboard)
@@ -2351,12 +2281,12 @@ class sonyutilitiesAction(InterfaceAction):
                             pubdate_string = strftime(self.device_timestamp_string(), newmi.pubdate)
                             if not (result["DateCreated"] == pubdate_string):
                                 set_clause += ', DateCreated = ? '
-                                debug_print("_update_metadata - convert_sony_date(result['DateCreated'])=", convert_sony_date(result["DateCreated"]))
-                                debug_print("_update_metadata - convert_sony_date(result['DateCreated']).__class__=", convert_sony_date(result["DateCreated"]).__class__)
-                                debug_print("_update_metadata - newmi.pubdate  =", newmi.pubdate)
-                                debug_print("_update_metadata - result['DateCreated']     =", result["DateCreated"])
-                                debug_print("_update_metadata - pubdate_string=", pubdate_string)
-                                debug_print("_update_metadata - newmi.pubdate.__class__=", newmi.pubdate.__class__)
+                                debug_print("convert_sony_date(result['DateCreated'])=", convert_sony_date(result["DateCreated"]))
+                                debug_print("convert_sony_date(result['DateCreated']).__class__=", convert_sony_date(result["DateCreated"]).__class__)
+                                debug_print("newmi.pubdate  =", newmi.pubdate)
+                                debug_print("result['DateCreated']     =", result["DateCreated"])
+                                debug_print("pubdate_string=", pubdate_string)
+                                debug_print("newmi.pubdate.__class__=", newmi.pubdate.__class__)
                                 update_values.append(pubdate_string)
 
                         if self.options[cfg.KEY_SET_ISBN]  and not result["ISBN"] == newmi.isbn:
@@ -2364,9 +2294,9 @@ class sonyutilitiesAction(InterfaceAction):
                             update_values.append(newmi.isbn)
 
                         if self.options[cfg.KEY_SET_LANGUAGE] and not result["Language"] == lang_as_iso639_1(newmi.language):
-                            debug_print("_update_metadata - newmi.language =", newmi.language)
-                            debug_print("_update_metadata - lang_as_iso639_1(newmi.language)=", lang_as_iso639_1(newmi.language))
-                            debug_print("_update_metadata - canonicalize_lang(newmi.language)=", canonicalize_lang(newmi.language))
+                            debug_print("newmi.language =", newmi.language)
+                            debug_print("lang_as_iso639_1(newmi.language)=", lang_as_iso639_1(newmi.language))
+                            debug_print("canonicalize_lang(newmi.language)=", canonicalize_lang(newmi.language))
 #                            set_clause += ', ISBN = ? '
 #                            update_values.append(newmi.isbn)
 
@@ -2377,15 +2307,15 @@ class sonyutilitiesAction(InterfaceAction):
                             update_values.append(1)
 
                         if self.supports_series:
-                            debug_print("_update_metadata - self.options['series']", self.options['series'])
-                            debug_print("_update_metadata - newmi.series=", newmi.series, "newmi.series_index=", newmi.series_index)
-                            debug_print("_update_metadata - result['Series'] ='%s' result['SeriesNumber'] =%s" % (result["Series"], result["SeriesNumber"]))
-                            debug_print("_update_metadata - result['Series'] == newmi.series =", (result["Series"] == newmi.series))
+                            debug_print("self.options['series']", self.options['series'])
+                            debug_print("newmi.series=", newmi.series, "newmi.series_index=", newmi.series_index)
+                            debug_print("result['Series'] ='%s' result['SeriesNumber'] =%s" % (result["Series"], result["SeriesNumber"]))
+                            debug_print("result['Series'] == newmi.series =", (result["Series"] == newmi.series))
                             series_index_str = ("%g" % newmi.series_index) if newmi.series_index is not None else None
-                            debug_print('_update_metadata - result["SeriesNumber"] == series_index_str =', (result["SeriesNumber"] == series_index_str))
-                            debug_print('_update_metadata - not (result["Series"] == newmi.series or result["SeriesNumber"] == series_index_str) =', not (result["Series"] == newmi.series or result["SeriesNumber"] == series_index_str))
+                            debug_print('result["SeriesNumber"] == series_index_str =', (result["SeriesNumber"] == series_index_str))
+                            debug_print('not (result["Series"] == newmi.series or result["SeriesNumber"] == series_index_str) =', not (result["Series"] == newmi.series or result["SeriesNumber"] == series_index_str))
                             if self.options['series'] and not (result["Series"] == newmi.series and (result["SeriesNumber"] == book.series_index_string or result["SeriesNumber"] == series_index_str)):
-                                debug_print("_update_metadata - setting series")
+                                debug_print("setting series")
                                 set_clause += ', Series  = ? '
                                 set_clause += ', SeriesNumber   = ? '
                                 if newmi.series is None or newmi.series == '':
@@ -2403,18 +2333,18 @@ class sonyutilitiesAction(InterfaceAction):
     
                         if self.options[cfg.KEY_SET_TAGS_IN_SUBTITLE] and (
                                 result["Subtitle"] is None or result["Subtitle"] == '' or result["Subtitle"][:3] == "t::" or result["Subtitle"][1] == "@"):
-                            debug_print("_update_metadata - newmi.tags =", newmi.tags)
+                            debug_print("newmi.tags =", newmi.tags)
                             tag_str = None
                             if len(newmi.tags):
                                 tag_str = " @".join(newmi.tags)
                                 tag_str = "@" + " @".join(newmi.tags)
-                            debug_print("_update_metadata - tag_str =", tag_str)
+                            debug_print("tag_str =", tag_str)
                             set_clause += ', Subtitle = ? '
                             update_values.append(tag_str)
 
-    #                    debug_print("_update_metadata - self.options['setRreadingStatus']", self.options['setRreadingStatus'])
-    #                    debug_print("_update_metadata - self.options['readingStatus']", self.options['readingStatus'])
-    #                    debug_print("_update_metadata - not (result[6] == self.options['readingStatus'])", not (result[6] == self.options['readingStatus']))
+    #                    debug_print("self.options['setRreadingStatus']", self.options['setRreadingStatus'])
+    #                    debug_print("self.options['readingStatus']", self.options['readingStatus'])
+    #                    debug_print("not (result[6] == self.options['readingStatus'])", not (result[6] == self.options['readingStatus']))
                         if self.options['setRreadingStatus'] and (not (result["ReadStatus"] == self.options['readingStatus']) or self.options['resetPosition']):
                             set_clause += ', ReadStatus  = ? '
                             update_values.append(self.options['readingStatus'])
@@ -2433,21 +2363,21 @@ class sonyutilitiesAction(InterfaceAction):
                             changes_found = True
 
                         if not (changes_found or rating_change_query):
-                            debug_print("_update_metadata - no changes found to selected metadata. No changes being made.")
+                            debug_print("no changes found to selected metadata. No changes being made.")
                             unchanged_books += 1
                             continue
     
                         update_query += 'WHERE ContentID = ? AND BookID IS NULL'
                         update_values.append(contentID)
-                        debug_print("_update_metadata - update_query=%s" % update_query)
-                        debug_print("_update_metadata - update_values= ", update_values)
+                        debug_print("update_query=%s" % update_query)
+                        debug_print("update_values= ", update_values)
                         try:
                             if changes_found:
                                 cursor.execute(update_query, update_values)
 
                             if rating_change_query:
-                                debug_print("_update_metadata - rating_change_query=%s" % rating_change_query)
-                                debug_print("_update_metadata - rating_values= ", rating_values)
+                                debug_print("rating_change_query=%s" % rating_change_query)
+                                debug_print("rating_values= ", rating_values)
                                 cursor.execute(rating_change_query, rating_values)
 
                             updated_books += 1
@@ -2455,7 +2385,7 @@ class sonyutilitiesAction(InterfaceAction):
                             debug_print('    Database Exception:  Unable to set series info')
                             raise
                     else:
-                        debug_print("_update_metadata - no match for title='%s' contentId='%s'" % (book.title, contentID))
+                        debug_print("no match for title='%s' contentId='%s'" % (book.title, contentID))
                         not_on_device_books += 1
                     connection.commit()
             debug_print("Update summary: Books updated=%d, unchanged books=%d, not on device=%d, Total=%d" % (updated_books, unchanged_books, not_on_device_books, count_books))
@@ -2477,7 +2407,6 @@ class sonyutilitiesAction(InterfaceAction):
         store_if_more_recent     = self.options[cfg.KEY_STORE_IF_MORE_RECENT]
         do_not_store_if_reopened = self.options[cfg.KEY_DO_NOT_STORE_IF_REOPENED]
         
-        import sqlite3 
         with closing(sqlite3.connect(self.device_database_path())) as connection:
             # return bytestrings if the content cannot the decoded as unicode
             connection.text_factory = lambda x: unicode(x, "utf-8", "ignore")
@@ -2489,11 +2418,11 @@ class sonyutilitiesAction(InterfaceAction):
             rating_column                   = library_config.get(cfg.KEY_RATING_CUSTOM_COLUMN, cfg.DEFAULT_LIBRARY_VALUES[cfg.KEY_RATING_CUSTOM_COLUMN])
             last_read_column                = library_config.get(cfg.KEY_LAST_READ_CUSTOM_COLUMN, cfg.DEFAULT_LIBRARY_VALUES[cfg.KEY_LAST_READ_CUSTOM_COLUMN])
             if sony_bookmark_column:
-                debug_print("_store_current_bookmark - sony_bookmark_column=", sony_bookmark_column)
+                debug_print("sony_bookmark_column=", sony_bookmark_column)
 #                sony_bookmark_col = custom_cols[sony_bookmark_column]
-#                debug_print("_store_current_bookmark - sony_bookmark_col=", sony_bookmark_col)
+#                debug_print("sony_bookmark_col=", sony_bookmark_col)
                 sony_bookmark_col_label = library_db.field_metadata.key_to_label(sony_bookmark_column)
-                debug_print("_store_current_bookmark - sony_bookmark_col_label=", sony_bookmark_col_label)
+                debug_print("sony_bookmark_col_label=", sony_bookmark_col_label)
             if sony_percentRead_column:
 #                sony_percentRead_col = custom_cols[sony_percentRead_column]
                 sony_percentRead_col_label = library_db.field_metadata.key_to_label(sony_percentRead_column)
@@ -2503,11 +2432,11 @@ class sonyutilitiesAction(InterfaceAction):
 #                sony_percentRead_col = custom_cols[sony_percentRead_column]
                 last_read_col_label = library_db.field_metadata.key_to_label(last_read_column)
 
-            debug_print("_store_current_bookmark - sony_bookmark_column=", sony_bookmark_column)
-            debug_print("_store_current_bookmark - sony_percentRead_column=", sony_percentRead_column) 
-            debug_print("_store_current_bookmark - rating_column=", rating_column) 
-            debug_print("_store_current_bookmark - rating_col_label=", rating_col_label) 
-            debug_print("_store_current_bookmark - last_read_column=", last_read_column) 
+            debug_print("sony_bookmark_column=", sony_bookmark_column)
+            debug_print("sony_percentRead_column=", sony_percentRead_column) 
+            debug_print("rating_column=", rating_column) 
+            debug_print("rating_col_label=", rating_col_label) 
+            debug_print("last_read_column=", last_read_column) 
 
 #            id_map = {}
             cursor = connection.cursor()
@@ -2515,10 +2444,10 @@ class sonyutilitiesAction(InterfaceAction):
                 count_books += 1
 #                mi = Metadata('Unknown')
                 for contentID in book.contentIDs:
-                    debug_print("_store_current_bookmark - contentId='%s'" % (contentID))
+                    debug_print("contentId='%s'" % (contentID))
                     fetch_values = (contentID,)
                     fetch_query = EPUB_FETCH_QUERY
-                    debug_print("_store_current_bookmark - fetch_query='%s'" % (fetch_query))
+                    debug_print("fetch_query='%s'" % (fetch_query))
                     cursor.execute(fetch_query, fetch_values)
                     result = cursor.fetchone()
                     
@@ -2527,7 +2456,7 @@ class sonyutilitiesAction(InterfaceAction):
                     last_read                = None
                     update_library           = False
                     if result is not None: 
-                        debug_print("_store_current_bookmark - result=", result)
+                        debug_print("result=", result)
                         books_with_bookmark += 1
                         if result[2] == 0 and clear_if_unread:
                             sony_bookmark = None
@@ -2546,22 +2475,18 @@ class sonyutilitiesAction(InterfaceAction):
                             elif result[2] == 2:
                                 sony_percentRead = 100
 
-                            if result[8]:
-                                sony_rating = result[8] * 2
-                            else:
-                                sony_rating = 0
                                 
                             if result[5]:
-                                debug_print("_store_current_bookmark - result[5]=", result[5])
+                                debug_print("result[5]=", result[5])
                                 last_read = convert_sony_date(result[5])
-                                debug_print("_store_current_bookmark - last_read=", last_read)
+                                debug_print("last_read=", last_read)
 
                             if last_read_column and store_if_more_recent:
             #                    last_read_col_label['#value#'] = last_read
                                 current_last_read = book.get_user_metadata(last_read_column, True)['#value#']
-                                debug_print("_store_current_bookmark - book.get_user_metadata(last_read_column, True)['#value#']=", current_last_read)
-                                debug_print("_store_current_bookmark - setting mi.last_read=", last_read)
-                                debug_print("_store_current_bookmark - store_if_more_recent - current_last_read < last_read=", current_last_read < last_read)
+                                debug_print("book.get_user_metadata(last_read_column, True)['#value#']=", current_last_read)
+                                debug_print("setting mi.last_read=", last_read)
+                                debug_print("store_if_more_recent - current_last_read < last_read=", current_last_read < last_read)
                                 if current_last_read and last_read:
                                     update_library &= current_last_read < last_read
                                 elif last_read:
@@ -2569,7 +2494,7 @@ class sonyutilitiesAction(InterfaceAction):
 
                             if sony_percentRead_column and do_not_store_if_reopened:
                                 current_percentRead = book.get_user_metadata(sony_percentRead_column, True)['#value#']
-                                debug_print("_store_current_bookmark - do_not_store_if_reopened - current_percentRead=", current_percentRead)
+                                debug_print("do_not_store_if_reopened - current_percentRead=", current_percentRead)
                                 update_library &= current_percentRead < 100
 
                     elif self.options[cfg.KEY_CLEAR_IF_UNREAD]:
@@ -2583,28 +2508,28 @@ class sonyutilitiesAction(InterfaceAction):
                         continue
                     
                     if update_library:
-                        debug_print("_store_current_bookmark - sony_bookmark='%s'" % (sony_bookmark))
-                        debug_print("_store_current_bookmark - sony_percentRead=", sony_percentRead)
+                        debug_print("sony_bookmark='%s'" % (sony_bookmark))
+                        debug_print("sony_percentRead=", sony_percentRead)
                         if sony_bookmark_column:
                             if sony_bookmark:
                                 new_value = sony_bookmark
                             else:
         #                        sony_bookmark_col['#value#'] = None
                                 new_value = None
-                                debug_print("_store_current_bookmark - setting bookmark column to None")
+                                debug_print("setting bookmark column to None")
         #                    mi.set_user_metadata(sony_bookmark_column, sony_bookmark_col)
-                            debug_print("_store_current_bookmark - bookmark - on sony=", new_value)
-                            debug_print("_store_current_bookmark - bookmark - in library=", book.get_user_metadata(sony_bookmark_column, True)['#value#'])
-                            debug_print("_store_current_bookmark - bookmark - on sony==in library=", new_value == book.get_user_metadata(sony_bookmark_column, True)['#value#'])
+                            debug_print("on sony=", new_value)
+                            debug_print("in library=", book.get_user_metadata(sony_bookmark_column, True)['#value#'])
+                            debug_print("on sony==in library=", new_value == book.get_user_metadata(sony_bookmark_column, True)['#value#'])
                             old_value = book.get_user_metadata(sony_bookmark_column, True)['#value#']
                             if not old_value == new_value: 
                                 library_db.set_custom(book.calibre_id, new_value, label=sony_bookmark_col_label, commit=False)
     
                         if sony_percentRead_column:
         #                    sony_percentRead_col['#value#'] = sony_percentRead
-                            debug_print("_store_current_bookmark - setting mi.sony_percentRead=", sony_percentRead)
+                            debug_print("setting mi.sony_percentRead=", sony_percentRead)
                             current_percentRead = book.get_user_metadata(sony_percentRead_column, True)['#value#']
-                            debug_print("_store_current_bookmark - percent read - in book=", current_percentRead)
+                            debug_print("percent read - in book=", current_percentRead)
                             if not current_percentRead == sony_percentRead:
                                 library_db.set_custom(book.calibre_id, sony_percentRead, label=sony_percentRead_col_label, commit=False)
         #                    mi.set_user_metadata(sony_percentRead_column, sony_percentRead_col)
@@ -2612,14 +2537,14 @@ class sonyutilitiesAction(InterfaceAction):
                         if last_read_column:
         #                    last_read_col_label['#value#'] = last_read
                             current_last_read = book.get_user_metadata(last_read_column, True)['#value#']
-                            debug_print("_store_current_bookmark - book.get_user_metadata(last_read_column, True)['#value#']=", current_last_read)
-                            debug_print("_store_current_bookmark - setting mi.last_read=", last_read)
-                            debug_print("_store_current_bookmark - current_last_read == last_read=", current_last_read == last_read)
+                            debug_print("book.get_user_metadata(last_read_column, True)['#value#']=", current_last_read)
+                            debug_print("setting mi.last_read=", last_read)
+                            debug_print("current_last_read == last_read=", current_last_read == last_read)
                             if not current_last_read == last_read:
                                 library_db.set_custom(book.calibre_id, last_read, label=last_read_col_label, commit=False)
         #                    mi.set_user_metadata(last_read_column, last_read_col_label)
     
-        #                debug_print("_store_current_bookmark - mi=", mi)
+        #                debug_print("mi=", mi)
         #                id_map[book.calibre_id] = mi
                     else:
                         books_with_bookmark    -= 1
@@ -2644,7 +2569,6 @@ class sonyutilitiesAction(InterfaceAction):
         library_config = cfg.get_library_config(library_db)
         sony_bookmark_column = library_config.get(cfg.KEY_CURRENT_LOCATION_CUSTOM_COLUMN, cfg.DEFAULT_LIBRARY_VALUES[cfg.KEY_CURRENT_LOCATION_CUSTOM_COLUMN])
         sony_percentRead_column         = library_config.get(cfg.KEY_PERCENT_READ_CUSTOM_COLUMN, cfg.DEFAULT_LIBRARY_VALUES[cfg.KEY_PERCENT_READ_CUSTOM_COLUMN])
-        rating_column                   = library_config.get(cfg.KEY_RATING_CUSTOM_COLUMN, cfg.DEFAULT_LIBRARY_VALUES[cfg.KEY_RATING_CUSTOM_COLUMN])
         last_read_column                = library_config.get(cfg.KEY_LAST_READ_CUSTOM_COLUMN, cfg.DEFAULT_LIBRARY_VALUES[cfg.KEY_LAST_READ_CUSTOM_COLUMN])
 
         chapter_query = 'SELECT c1.bookmark, ' \
@@ -2667,7 +2591,6 @@ class sonyutilitiesAction(InterfaceAction):
                             'WHERE BookID IS NULL '        \
                             'AND ContentID = ?'
 
-        import sqlite3 
         with closing(sqlite3.connect(self.device_database_path()
             )) as connection:
             # return bytestrings if the content cannot the decoded as unicode
@@ -2684,7 +2607,7 @@ class sonyutilitiesAction(InterfaceAction):
                     result = cursor.fetchone()
                     
                     if result is not None: # and not result[6] == MIMETYPE_SONY:
-                        debug_print("_restore_current_bookmark - result= ", result)
+                        debug_print("result= ", result)
                         chapter_update          = 'UPDATE content SET '
                         chapter_set_clause      = ''
                         chapter_values          = []
@@ -2697,7 +2620,7 @@ class sonyutilitiesAction(InterfaceAction):
     
                         if sony_bookmark_column:
                             reading_location_string  = book.get_user_metadata(sony_bookmark_column, True)['#value#']
-                            debug_print("_restore_current_bookmark - reading_location_string=", reading_location_string)
+                            debug_print("reading_location_string=", reading_location_string)
                             if reading_location_string:
                                 if result['MimeType'] == MIMETYPE_SONY:
                                     sony_bookmark = reading_location_string
@@ -2711,7 +2634,7 @@ class sonyutilitiesAction(InterfaceAction):
                                 chapter_values.append(sony_bookmark)
                                 chapter_set_clause += ', bookmark  = ? '
                             else:
-                                debug_print("_restore_current_bookmark - reading_location_string=", reading_location_string)
+                                debug_print("reading_location_string=", reading_location_string)
 
                         if sony_percentRead_column:
                             sony_percentRead = book.get_user_metadata(sony_percentRead_column, True)['#value#']
@@ -2721,13 +2644,13 @@ class sonyutilitiesAction(InterfaceAction):
 
                         if self.options[cfg.KEY_READING_STATUS]:
                             if sony_percentRead:
-                                debug_print("_restore_current_bookmark - chapter_values= ", chapter_values)
+                                debug_print("chapter_values= ", chapter_values)
                                 if sony_percentRead == 100:
                                     chapter_values.append(2)
-                                    debug_print("_restore_current_bookmark - chapter_values= ", chapter_values)
+                                    debug_print("chapter_values= ", chapter_values)
                                 else:
                                     chapter_values.append(1)
-                                    debug_print("_restore_current_bookmark - chapter_values= ", chapter_values)
+                                    debug_print("chapter_values= ", chapter_values)
                                 chapter_set_clause += ', ReadStatus  = ? '
                                 chapter_values.append('false')
                                 chapter_set_clause += ', FirstTimeReading = ? '
@@ -2742,10 +2665,10 @@ class sonyutilitiesAction(InterfaceAction):
                                 chapter_values.append(last_read.strftime(self.device_timestamp_string()))
                                 chapter_set_clause += ', DateLastRead  = ? '
 
-                        debug_print("_restore_current_bookmark - found contentId='%s'" % (contentID))
-                        debug_print("_restore_current_bookmark - sony_bookmark=", sony_bookmark)
-                        debug_print("_restore_current_bookmark - sony_percentRead=", sony_percentRead)
-                        debug_print("_restore_current_bookmark - last_read=", last_read)
+                        debug_print("found contentId='%s'" % (contentID))
+                        debug_print("sony_bookmark=", sony_bookmark)
+                        debug_print("sony_percentRead=", sony_percentRead)
+                        debug_print("last_read=", last_read)
 #                        debug_print("    result=", result)
     
                         if len(chapter_set_clause) > 0:
@@ -2753,12 +2676,12 @@ class sonyutilitiesAction(InterfaceAction):
                             chapter_update += 'WHERE ContentID = ? AND BookID IS NULL'
                             chapter_values.append(contentID)
                         else:
-                            debug_print("_restore_current_bookmark - no changes found to selected metadata. No changes being made.")
+                            debug_print("no changes found to selected metadata. No changes being made.")
                             not_on_device_books += 1
                             continue
     
-                        debug_print("_restore_current_bookmark - chapter_update=%s" % chapter_update)
-                        debug_print("_restore_current_bookmark - chapter_values= ", chapter_values)
+                        debug_print("chapter_update=%s" % chapter_update)
+                        debug_print("chapter_values= ", chapter_values)
                         try:
                             cursor.execute(chapter_update, chapter_values)
                                 
@@ -2767,10 +2690,10 @@ class sonyutilitiesAction(InterfaceAction):
                             debug_print('    Database Exception:  Unable to set bookmark info.')
                             raise
                     else:
-                        debug_print("_restore_current_bookmark - no match for title='%s' contentId='%s'" % (book.title, book.contentID))
+                        debug_print("no match for title='%s' contentId='%s'" % (book.title, book.contentID))
                         not_on_device_books += 1
                     connection.commit()
-            debug_print("_restore_current_bookmark - Update summary: Books updated=%d, not on device=%d, Total=%d" % (updated_books, not_on_device_books, count_books))
+            debug_print("Update summary: Books updated=%d, not on device=%d, Total=%d" % (updated_books, not_on_device_books, count_books))
 
             cursor.close()
         
@@ -2779,8 +2702,7 @@ class sonyutilitiesAction(InterfaceAction):
 
 
     def fetch_book_fonts(self):
-        debug_print("fetch_book_fonts - start")
-        import sqlite3 
+        debug_print("start")
         with closing(sqlite3.connect(self.device.normalize_path(
             self.device_path + DBPATH))) as connection:
             # return bytestrings if the content cannot the decoded as unicode
@@ -2826,13 +2748,12 @@ class sonyutilitiesAction(InterfaceAction):
 
 
     def _set_reader_fonts(self, contentIDs, delete=False):
-        debug_print("_set_reader_fonts - start")
+        debug_print("start")
         updated_fonts  = 0
         added_fonts    = 0
         deleted_fonts  = 0
         count_books    = 0
 
-        import sqlite3 
         with closing(sqlite3.connect(self.device.normalize_path(
             self.device_path + DBPATH))) as connection:
             # return bytestrings if the content cannot the decoded as unicode
@@ -2920,7 +2841,7 @@ class sonyutilitiesAction(InterfaceAction):
         config_file_path = self.device.normalize_path(self.device._main_prefix + '.sony/Sony/Sony eReader.conf')
         sonyConfig = ConfigParser.SafeConfigParser(allow_no_value=True)
         sonyConfig.optionxform = str
-        debug_print("_update_config_reader_settings - config_file_path=", config_file_path)
+        debug_print("config_file_path=", config_file_path)
         sonyConfig.read(config_file_path)
         
         return sonyConfig, config_file_path
@@ -2938,18 +2859,16 @@ class sonyutilitiesAction(InterfaceAction):
         with open(config_file_path, 'wb') as config_file:
             sonyConfig.write(config_file)
 
-
-    def device_database_path(self, prefix=None):
-        if not prefix:
-            prefix = self.current_location['prefix']
-        return self.device.normalize_path(prefix + DBPATH)
-
+    def _device_database_paths(self):
+        dbs = [(location['prefix'],self.device.normalize_path(location['prefix']) + DBPATH) 
+               for location in self.current_device_info.values()]
+        return dict(dbs)
 
     def show_help1(self):
         self.show_help()
 
     def show_help(self, anchor=''):
-        debug_print("show_help - anchor=", anchor)
+        debug_print("anchor=", anchor)
         # Extract on demand the help file resource
         def get_help_file_resource():
             # We will write the help file out every time, in case the user upgrades the plugin zip
@@ -2960,19 +2879,15 @@ class sonyutilitiesAction(InterfaceAction):
             with open(file_path,'w') as f:
                 f.write(file_data)
             return file_path
-        debug_print("show_help - anchor=", anchor)
+        debug_print("anchor=", anchor)
         url = 'file:///' + get_help_file_resource()
         url = QUrl(url)
         if not (anchor or anchor == ''):
             url.setFragment(anchor)
         open_url(url)
 
-    def convert_sony_date(self, sony_date):
-        return convert_sony_date(sony_date)
-
 
 def check_device_database(database_path):
-    import sqlite3 
     with closing(sqlite3.connect(database_path)) as connection:
         # return bytestrings if the content cannot the decoded as unicode
         connection.text_factory = lambda x: unicode(x, "utf-8", "ignore")
@@ -2991,16 +2906,6 @@ def check_device_database(database_path):
             check_result = _("Execution of '%s' failed") % check_query
 
         connection.commit()
-
         cursor.close()
 
     return check_result
-
-
-def convert_sony_date(sony_date):
-    from calibre.utils.date import utc_tz
-    if sony_date:
-        converted_date = datetime.fromtimestamp(sony_date/1000).replace(tzinfo=utc_tz)
-    else:
-        converted_date = None
-    return converted_date
