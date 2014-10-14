@@ -6,16 +6,16 @@ __license__   = 'GPL v3'
 __copyright__ = '2014, Derek Broughton <auspex@pointerstop.ca>'
 __docformat__ = 'restructuredtext en'
 
-try:
+try:    # need to import init_calibre for doctests
     import init_calibre
 except ImportError:
     pass
+
 import ConfigParser
 import os, threading, time, shutil
 from datetime import datetime, timedelta
 from contextlib import closing
 from collections import OrderedDict
-from calibre.devices.prst1.driver import DBPATH 
 try:
     from PyQt5.Qt import QUrl, pyqtSignal, QTimer
 #     from PyQt5.Qt import (Qt, QApplication, QMenu, QToolButton, QStandardItemModel, QStandardItem, QUrl, QModelIndex, QFileDialog)
@@ -24,6 +24,21 @@ except ImportError:
     from PyQt4.Qt import QUrl, pyqtSignal, QTimer
     from PyQt4.Qt import (QMenu, QUrl, QModelIndex, QFileDialog)
 
+# import anything we need from this plugin before any other calibre imports
+# this ensures that we don't get a stale version from the plugin zipfile when running tests.
+from calibre_plugins.sonyutilities.dialogs import (
+                    ReaderOptionsDialog, CoverUploadOptionsDialog, RemoveCoverOptionsDialog, AboutDialog, 
+                    UpdateMetadataOptionsDialog, ChangeReadingStatusOptionsDialog, ShowBooksNotInDeviceDatabaseDialog, 
+                    ManageSeriesDeviceDialog, BookmarkOptionsDialog, QueueProgressDialog, CleanImagesDirOptionsDialog, BlockAnalyticsOptionsDialog,
+                    FixDuplicateShelvesDialog, OrderSeriesShelvesDialog, ShowReadingPositionChangesDialog
+                    )
+from calibre_plugins.sonyutilities.common_utils import (set_plugin_icon_resources, get_icon, ProgressBar,
+                                                        SonyDB, convert_sony_date,
+                                                        create_menu_action_unique,  debug_print)
+from calibre_plugins.sonyutilities.book import SeriesBook
+import calibre_plugins.sonyutilities.config as cfg
+
+from calibre.devices.prst1.driver import DBPATH 
 from calibre import strftime
 from calibre.gui2 import error_dialog, info_dialog, open_url, question_dialog, FileDialog
 from calibre.gui2.actions import InterfaceAction
@@ -39,18 +54,6 @@ from calibre.devices.prst1.driver import PRST1
 from calibre.devices.usbms.books import Book
 # from calibre.devices.usbms.books import CollectionsBookList
 from calibre.devices.usbms.driver import USBMS
-
-from calibre_plugins.sonyutilities.dialogs import (
-                    ReaderOptionsDialog, CoverUploadOptionsDialog, RemoveCoverOptionsDialog, AboutDialog, 
-                    UpdateMetadataOptionsDialog, ChangeReadingStatusOptionsDialog, ShowBooksNotInDeviceDatabaseDialog, 
-                    ManageSeriesDeviceDialog, BookmarkOptionsDialog, QueueProgressDialog, CleanImagesDirOptionsDialog, BlockAnalyticsOptionsDialog,
-                    FixDuplicateShelvesDialog, OrderSeriesShelvesDialog, ShowReadingPositionChangesDialog
-                    )
-from calibre_plugins.sonyutilities.common_utils import (set_plugin_icon_resources, get_icon, ProgressBar,
-                                                        SonyDB, convert_sony_date,
-                                                        create_menu_action_unique,  debug_print)
-from calibre_plugins.sonyutilities.book import SeriesBook
-import calibre_plugins.sonyutilities.config as cfg
 import sqlite3 
 
 PLUGIN_ICONS = ['images/icon.png', 'images/logo_sony.png', 'images/manage_series.png', 'images/lock.png', 'images/lock32.png',
@@ -147,18 +150,17 @@ class sonyutilitiesAction(InterfaceAction):
         """
         If there is currently a Sony PRST1 device attached, return True
         
-        Create a dummy PRST1 device 
-        >>> class PRST1():
-        ...    pass
-        >>> action = sonyutilitiesAction()
+        >>> from calibre_plugins.sonyutilities.action import sonyutilitiesAction
+        >>> from calibre.devices.prst1.driver import PRST1
+        >>> action = sonyutilitiesAction(None, None)
         
         When the device 
         >>> action.device = None
-        >>> print(action.haveSony)
+        >>> print(action.haveSony())
         False
 
-        >>> action.device = PRST1
-        >>> print(action.haveSony)
+        >>> action.device = PRST1(None)
+        >>> print(action.haveSony())
         True
         
         """
@@ -1360,8 +1362,8 @@ class sonyutilitiesAction(InterfaceAction):
         about how the Sony has catalogued it, so interrogate the device database
         (this function is only called for a single device)
         
-        >>> print(action.get_contentIDs_for_books([1,2,3]), 'main')
-        [2,4,6]
+#         >>> print(action.get_contentIDs_for_books([1,2,3]), 'main')
+#         [2,4,6]
         
         I'm honestly unsure how useful this method is.  We often need to know all the content IDs for 
         a single book, but I don't think we need a list of all content IDs without knowing which card

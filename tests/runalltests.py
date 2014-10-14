@@ -36,7 +36,7 @@ def load_tests(loader, tests, ignore):
 
     Provided this test is still running last in the suite, this won't break anything, but will show 
     what happens when you use the implicit display:
-    >>> 'this is a string'
+    >>> str('this is a string')
     'this is a string'
     >>> print(_)
     this is a string
@@ -57,11 +57,13 @@ def load_tests(loader, tests, ignore):
                                   module_relative=False,
 #                                   setUp      = setUp,
 #                                   tearDown   = tearDown,
-                                  globs      = {'DEBUG': True},
+#                                   globs      = {'DEBUG': True},
                                   optionflags= doctest.ELLIPSIS
                           )
     tests.addTests(suite)
     return tests
 
 if __name__ == '__main__':
+    pythonpath = ':'.join([x for x in sys.path if x ])
+    print ('PYTHONPATH='+pythonpath)
     unittest.main()

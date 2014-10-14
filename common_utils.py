@@ -10,12 +10,14 @@ __docformat__ = 'restructuredtext en'
 
 import os, time
 try:
-    from PyQt5.Qt import (Qt, QIcon, QPixmap, QLabel, QDialog, QHBoxLayout, QProgressBar,
+    from PyQt5.Qt import Qt
+    from PyQt5.Qt import (QIcon, QPixmap, QLabel, QDialog, QHBoxLayout, QProgressBar,
                           QTableWidgetItem, QFont, QLineEdit, QComboBox,
                           QVBoxLayout, QDialogButtonBox, QStyledItemDelegate, QDateTime,
                           QRegExpValidator, QRegExp, )
 except ImportError:
-    from PyQt4.Qt import (Qt, QIcon, QPixmap, QLabel, QDialog, QHBoxLayout, QProgressBar,
+    from PyQt4.Qt import Qt
+    from PyQt4.Qt import (QIcon, QPixmap, QLabel, QDialog, QHBoxLayout, QProgressBar,
                           QTableWidgetItem, QFont, QLineEdit, QComboBox,
                           QVBoxLayout, QDialogButtonBox, QStyledItemDelegate, QDateTime,
                           QRegExpValidator, QRegExp)
@@ -42,12 +44,14 @@ def debug_print(*args):
     Print all args, prefixed by a time stamp and the module/method from which it was called
     
     >>> from calibre_plugins.sonyutilities.common_utils import debug_print
+    >>> global DEBUG
     >>> DEBUG=True
     
     Unfortunately, that doesn't seem to actually set DEBUG, and we get nothing...
     >>> debug_print("test", "message")
     
     """
+    #TODO: figure out how to set DEBUG=True in tests
     if DEBUG:
         code = sys._getframe(1).f_code
         method_name = code.co_filename+'::'+code.co_name
@@ -209,7 +213,7 @@ def get_library_uuid(db):
 class ImageLabel(QLabel):
 
     def __init__(self, parent, icon_name, size=16):
-        QLabel.__init__(self, parent)
+        super(QLabel,self).__init__(self, parent)
         pixmap = get_pixmap(icon_name)
         self.setPixmap(pixmap)
         self.setMaximumSize(size, size)
@@ -221,7 +225,7 @@ class ImageTitleLayout(QHBoxLayout):
     A reusable layout widget displaying an image followed by a title
     '''
     def __init__(self, parent, icon_name, title):
-        QHBoxLayout.__init__(self)
+        super(QHBoxLayout,self).__init__(self)
         self.title_image_label = QLabel(parent)
         self.update_title_icon(icon_name)
         self.addWidget(self.title_image_label)
@@ -257,7 +261,7 @@ class SizePersistedDialog(QDialog):
     restored when they are next opened.
     '''
     def __init__(self, parent, unique_pref_name):
-        QDialog.__init__(self, parent)
+        super(QDialog,self).__init__(self, parent)
         self.unique_pref_name = unique_pref_name
         self.geom = gprefs.get(unique_pref_name, None)
         self.finished.connect(self.dialog_closing)
@@ -282,13 +286,13 @@ class ReadOnlyTableWidgetItem(QTableWidgetItem):
     def __init__(self, text):
         if text is None:
             text = ''
-        QTableWidgetItem.__init__(self, text, QTableWidgetItem.UserType)
+        super(QTableWidgetItem,self).__init__(self, text, QTableWidgetItem.UserType)
         self.setFlags(Qt.ItemIsSelectable|Qt.ItemIsEnabled)
 
 class RatingTableWidgetItem(QTableWidgetItem):
 
     def __init__(self, rating, is_read_only=False):
-        QTableWidgetItem.__init__(self, '', QTableWidgetItem.UserType)
+        super(QTableWidgetItem,self).__init__(self, '', QTableWidgetItem.UserType)
         self.setData(Qt.DisplayRole, rating)
         if is_read_only:
             self.setFlags(Qt.ItemIsSelectable|Qt.ItemIsEnabled)
@@ -301,11 +305,11 @@ class DateTableWidgetItem(QTableWidgetItem):
         if date_read is None or date_read == UNDEFINED_DATE and default_to_today:
             date_read = now()
         if is_read_only:
-            QTableWidgetItem.__init__(self, format_date(date_read, fmt), QTableWidgetItem.UserType)
+            super(QTableWidgetItem,self).__init__(self, format_date(date_read, fmt), QTableWidgetItem.UserType)
             self.setFlags(Qt.ItemIsSelectable|Qt.ItemIsEnabled)
             self.setData(Qt.DisplayRole, QDateTime(date_read))
         else:
-            QTableWidgetItem.__init__(self, '', QTableWidgetItem.UserType)
+            super(QTableWidgetItem,self).__init__(self, '', QTableWidgetItem.UserType)
             self.setData(Qt.DisplayRole, QDateTime(date_read))
 
 from calibre.gui2.library.delegates import DateDelegate as _DateDelegate
@@ -361,7 +365,7 @@ class NoWheelComboBox(QComboBox):
 class CheckableTableWidgetItem(QTableWidgetItem):
 
     def __init__(self, checked=False, is_tristate=False):
-        QTableWidgetItem.__init__(self, '')
+        super(QTableWidgetItem,self).__init__(self, '')
         self.setFlags(Qt.ItemFlags(Qt.ItemIsSelectable | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled ))
         if is_tristate:
             self.setFlags(self.flags() | Qt.ItemIsTristate)
@@ -387,7 +391,7 @@ class CheckableTableWidgetItem(QTableWidgetItem):
 class TextIconWidgetItem(QTableWidgetItem):
 
     def __init__(self, text, icon):
-        QTableWidgetItem.__init__(self, text)
+        super(QTableWidgetItem,self).__init__(self, text)
         if icon:
             self.setIcon(icon)
 
@@ -405,7 +409,7 @@ class ReadOnlyLineEdit(QLineEdit):
     def __init__(self, text, parent):
         if text is None:
             text = ''
-        QLineEdit.__init__(self, text, parent)
+        super(QLineEdit,self).__init__(self, text, parent)
         self.setEnabled(False)
 
 
@@ -414,14 +418,14 @@ class NumericLineEdit(QLineEdit):
     Allows a numeric value up to two decimal places, or an integer
     '''
     def __init__(self, *args):
-        QLineEdit.__init__(self, *args)
+        super(QLineEdit,self).__init__(self, *args)
         self.setValidator(QRegExpValidator(QRegExp(r'(^\d*\.[\d]{1,2}$)|(^[1-9]\d*[\.]$)'), self))
 
 
 class KeyValueComboBox(QComboBox):
 
     def __init__(self, parent, values, selected_key):
-        QComboBox.__init__(self, parent)
+        super(QComboBox,self).__init__(self, parent)
         self.values = values
         self.populate_combo(selected_key)
 
@@ -444,7 +448,7 @@ class KeyValueComboBox(QComboBox):
 class KeyComboBox(QComboBox):
 
     def __init__(self, parent, values, selected_key):
-        QComboBox.__init__(self, parent)
+        super(QComboBox,self).__init__(self, parent)
         self.values = values
         self.populate_combo(selected_key)
 
@@ -466,7 +470,7 @@ class KeyComboBox(QComboBox):
 class CustomColumnComboBox(QComboBox):
 
     def __init__(self, parent, custom_columns={}, selected_column='', initial_items=['']):
-        QComboBox.__init__(self, parent)
+        super(QComboBox,self).__init__(self, parent)
         self.populate_combo(custom_columns, selected_column, initial_items)
 
     def populate_combo(self, custom_columns, selected_column, initial_items=['']):
@@ -526,9 +530,9 @@ class ProgressBar(QDialog):
     def __init__(self, parent=None, max_items=100, window_title='Progress Bar',
                  label='Label goes here', on_top=False):
         if on_top:
-            QDialog.__init__(self, parent=parent, flags=Qt.WindowStaysOnTopHint)
+            super(QDialog,self).__init__(self, parent=parent, flags=Qt.WindowStaysOnTopHint)
         else:
-            QDialog.__init__(self, parent=parent)
+            super(QDialog,self).__init__(self, parent=parent)
         self.application = Application
         self.setWindowTitle(window_title)
         self.l = QVBoxLayout(self)
@@ -574,6 +578,11 @@ class Cursor():
     True
     >>> print (x.cursor)
     <sqlite3.Cursor object at ...
+    
+    Clean up:
+    >>> import subprocess
+    >>> print(subprocess.call("rm -rvf "+path1, shell=True))
+    0
        
     """
     def __init__(self,path):
@@ -593,6 +602,8 @@ class SonyDB(dict):
     The structure is suitable for using within a "with closing(...) as ..." structure
     and all cursors will be automatically closed when the end of the "with" block is reached.
       
+    >>> import subprocess
+    
     Create a SonyDB object (using empty databases), and check that it has correct structure
     >>> from calibre_plugins.sonyutilities.common_utils import SonyDB
     >>> path1 = os.tempnam()
@@ -632,6 +643,10 @@ class SonyDB(dict):
         ...
     DatabaseError: file is encrypted or is not a database
           
+    Clean up:
+    >>> print(subprocess.call("rm -rvf %s %s" % (path1, path2), shell=True))
+    0
+       
     """
 
     def __init__(self, db):

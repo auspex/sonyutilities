@@ -8,6 +8,11 @@ __copyright__ = '2012, David Forrester <davidfor@internode.on.net>'\
                 '2014, Derek Broughton <auspex@pointerstop.ca>'
 __docformat__ = 'restructuredtext en'
 
+try:    # need to import init_calibre for doctests
+    import init_calibre
+except ImportError:
+    pass
+
 import os
 import re
 import shutil
@@ -15,15 +20,18 @@ from datetime import datetime
 
 from contextlib import closing
 
-from calibre.utils.ipc.server import Server
-from calibre.utils.ipc.job import ParallelJob
-from calibre.utils.logging import Log
+# import anything we need from this plugin before any other calibre imports
+# this ensures that we don't get a stale version from the plugin zipfile when running tests.
 from calibre_plugins.sonyutilities.action import (
                     EPUB_FETCH_QUERY, 
                     check_device_database)
 import calibre_plugins.sonyutilities.config as cfg
 from calibre_plugins.sonyutilities.common_utils import debug_print, convert_sony_date, SonyDB
 from calibre_plugins.sonyutilities.book import EbookIterator
+
+from calibre.utils.ipc.server import Server
+from calibre.utils.ipc.job import ParallelJob
+from calibre.utils.logging import Log
 
 def do_device_database_backup(backup_options, notification=lambda x,y:x):
     """
@@ -53,16 +61,36 @@ def do_device_database_backup(backup_options, notification=lambda x,y:x):
     ...     'database_file': source_dir+"/books.db",
     ...     'copies': 2
     ... }
-    >>> #from calibre_plugins.sonyutilities.jobs import do_device_database_backup
-    >>> ret=do_device_database_backup(backup_options)
-    >>> print(subprocess.check_output("ls %(dest)s" % backup_options, stderr=subprocess.STDOUT, shell=True))
-    books.db  notepads.db
-    >>> print(subprocess.call("rm -rf "+source_dir, shell=True))
+    >>> from calibre_plugins.sonyutilities.jobs import do_device_database_backup
+    
+    Do the backup: if successful will return True
+    >>> print(do_device_database_backup(backup_options))
+    True
+    
+    Now we should have a directory in the "dest" directory named Sony Reader-main-abcdef- followed by a timestamp
+    and the two .db files created above, but not the text file 
+    >>> print(subprocess.check_output("ls %(dest)s/" % backup_options, stderr=subprocess.STDOUT, shell=True))
+    Sony Reader-main-abcdef...
+    >>> print(subprocess.check_output("ls %(dest)s/*" % backup_options, stderr=subprocess.STDOUT, shell=True))
+    books.db
+    notepads.db
+    <BLANKLINE>
+    
+    Run the backup again, it should fail because we already did a backup today (unless
+    you managed to run the first backup moments before midnight!)
+    >>> print(do_device_database_backup(backup_options))
+    False
+    
+    Now clean up the temporary directories, first the source:
+    >>> print(subprocess.call("rm -rvf "+source_dir, shell=True))
     0
-    >>> print(subprocess.call("rm -rf %(dest)s" % backup_options, shell=True))
+    
+    And the destination:
+    >>> print(subprocess.call("rm -rvf %(dest)s" % backup_options, shell=True))
     0
     
     """
+    #TODO: add tests to check that any more than "copies_to_keep" copies are deleted 
     debug_print("start")
        
     BACKUP_FILE_TEMPLATE = '{0}-{1}-{2}-{3}'
@@ -150,7 +178,7 @@ def do_device_database_backup(backup_options, notification=lambda x,y:x):
         debug_print('Manually managing backups')
 
     notification(1, _("Sony device database backup finished"))
-    return False
+    return True
 
 
 def do_store_locations(books_to_scan, options, notification=lambda x,y:x):

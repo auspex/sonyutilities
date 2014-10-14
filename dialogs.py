@@ -246,7 +246,7 @@ class ReaderOptionsDialog(SizePersistedDialog):
         # Set some default values from last time dialog was used.
         self.prefs = cfg.plugin_prefs[cfg.READING_OPTIONS_STORE_NAME]
         self.change_settings(self.prefs)
-        debug_print("", self.prefs)
+        debug_print(self.prefs)
         if self.prefs.get(cfg.KEY_READING_LOCK_MARGINS, False):
             self.lock_margins_checkbox.click()
         if self.prefs.get(cfg.KEY_UPDATE_CONFIG_FILE, False):

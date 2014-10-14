@@ -9,11 +9,15 @@ __docformat__ = 'restructuredtext en'
 
 import re
 import os
+try:
+    import init_calibre # must be imported for nosetests
+except ImportError:
+    pass
 
+from calibre_plugins.sonyutilities.common_utils import debug_print
 from calibre.utils.date import format_date
 from calibre.ebooks.metadata import fmt_sidx
 from calibre.ebooks.metadata.book.base import Metadata
-from calibre_plugins.sonyutilities.common_utils import debug_print
 from calibre.ebooks.oeb.iterator.book import EbookIterator as _iterator
 from calibre.ebooks.oeb.parse_utils import parse_html, xpath
 from lxml import etree
@@ -213,17 +217,19 @@ class EbookIterator(_iterator):
         A sony bookmark looks like:
         >>> sony_bookmark = "titlepage.xhtml#point(/1/4/2/2:0)"
         
-        Create a dummy book class that doesn't actually have to open a file 
-        >>> from calibre_plugins.sonyutilities.iterator import EbookIterator
+        Create a dummy book class that doesn't actually have to open a file
+        >>> from calibre_plugins.sonyutilities.book import EbookIterator 
         >>> class Tempdir():
         ...     tdir='/tmp'
+        ... 
         >>> class DummyBook(EbookIterator):
         ...     def __init__(self):
         ...         self.spine = ['/tmp/dummy1.xhtml', '/tmp/titlepage.xhtml', '/tmp/dummy1.xhtml',]
         ...         self._tdir = Tempdir()
+        ... 
         >>> book = DummyBook()
-        >>> print(book.convert_from_sony_bookmark(sony_bookmark,'my bookmark'))
-        {'spine': 1, 'type': 'cfi', 'pos': u'/2/4/2/2:0', 'title': 'my bookmark'}
+        >>> print(book.convert_from_sony_bookmark(sony_bookmark,u'my bookmark'))
+        {'spine': 1, 'type': u'cfi', 'pos': u'/2/4/2/2:0', 'title': u'my bookmark'}
         
         """
         filename,pos = bookmark.split('#point')
@@ -249,8 +255,17 @@ class EbookIterator(_iterator):
         The (internal) Calibre bookmark is a dictionary:
         >>> calibre_bm = {'spine': 1, 'type': 'cfi', 'pos': u'/2/4/2/2:0', 'title': 'my bookmark'}
         
-        >>> print(book.convert_to_sony_bookmark(calibre_bm))
-        titlepage.xhtml#point(/1/4/2/2:0)
+        >>> class Tempdir():
+        ...     tdir='/tmp'
+        ... 
+        >>> class DummyBook(EbookIterator):
+        ...     def __init__(self):
+        ...         self.spine = ['/tmp/dummy1.xhtml', '/tmp/titlepage.xhtml', '/tmp/dummy1.xhtml',]
+        ...         self._tdir = Tempdir()
+        ... 
+        >>> book = DummyBook()
+        >>> print(book.convert_to_sony_bookmark(calibre_bm)==sony_bookmark)
+        True
         
         """
         prefix      = self._tdir.tdir+'/'
@@ -260,7 +275,7 @@ class EbookIterator(_iterator):
         # ADE doesn't count the <HEAD> tag
         if pos[1] == '2':
             pos[1]  = '1'
-                
+        
         bookmark = "%s#point(%s)" % (filename, '/'.join(pos))
         return bookmark
 
